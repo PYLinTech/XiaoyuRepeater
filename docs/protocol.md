@@ -4,7 +4,7 @@
 
 中继分为两层：
 
-- **控制面**：API 密钥、房间生命周期、加入前鉴权、加入/离开事件。
+- **控制面**：API 密钥、房间生命周期、加入前鉴权、轨道订阅控制、加入/离开与轨道事件。
 - **数据面**：房间内用户之间的 WebSocket 帧原样转发，以及可选的自托管 WebRTC SFU 轨道转发。中继不读取、不记录、不改写业务内容，也不把用户数据转发给使用方程序。
 
 ---
@@ -129,7 +129,29 @@ Authorization: Bearer <API密钥>
       "id": "r_xxxxxxxxx",
       "name": "演示房间",
       "participants": 2,
-      "created_at": "2026-11-16T09:59:00Z"
+      "created_at": "2026-11-16T09:59:00Z",
+      "connections": [
+        {
+          "conn_id": "p_xxxxxxxx",
+          "transport": "webrtc",
+          "subject": "Alice"
+        },
+        {
+          "conn_id": "u_xxxxxxxx",
+          "transport": "ws",
+          "subject": "Bob"
+        }
+      ],
+      "tracks": [
+        {
+          "id": "t_xxxxxxxx",
+          "kind": "audio",
+          "stream_id": "microphone",
+          "codec": "audio/opus",
+          "publisher_id": "p_xxxxxxxx",
+          "subject": "Alice"
+        }
+      ]
     }
   ],
   "limits": {
@@ -143,7 +165,7 @@ Authorization: Bearer <API密钥>
 }
 ```
 
-`rooms` 是该密钥名下仍存活的房间，使用方可据此恢复业务状态。服务端每 20 秒发送 WebSocket Ping，客户端需正常回应 Pong；75 秒无读取活动会断开。
+`rooms` 是该密钥名下仍存活的房间，使用方可据此恢复业务状态。`connections` 是当前在线连接快照（同时包含 `ws` 与 `webrtc`），`conn_id` 与 `user_joined` 一致；`participants` 为兼容字段，等于 `connections` 数量。使用方重连后可据此为已有 WebRTC 参与者恢复订阅。每个房间的 `tracks` 是当前已发布轨道的快照，结构同下文 `track_added.track`。服务端每 20 秒发送 WebSocket Ping，客户端需正常回应 Pong；75 秒无读取活动会断开。
 
 ### 3.2 鉴权请求
 
@@ -262,7 +284,106 @@ Authorization: Bearer <API密钥>
 
 控制通道还支持 JSON 心跳消息 `ping` / `pong`（`{"type":"ping","time":"..."}`），收到 `ping` 应回复 `pong`；WebSocket 协议层 Ping/Pong 同时生效。
 
-### 3.5 断开与密钥撤销
+### 3.5 WebRTC 轨道事件与订阅
+
+轨道发布或结束时，服务端向使用方发送房间级事件。事件只包含轨道元数据，不包含媒体字节：
+
+```json
+{
+  "type": "track_published",
+  "room_id": "r_xxxxxxxxx",
+  "room_name": "演示房间",
+  "conn_id": "p_xxxxxxxx",
+  "track": {
+    "id": "t_xxxxxxxx",
+    "kind": "audio",
+    "stream_id": "microphone",
+    "codec": "audio/opus",
+    "publisher_id": "p_xxxxxxxx",
+    "subject": "Alice"
+  },
+  "published_at": "2026-11-16T10:00:06Z"
+}
+```
+
+```json
+{
+  "type": "track_unpublished",
+  "room_id": "r_xxxxxxxxx",
+  "room_name": "演示房间",
+  "conn_id": "p_xxxxxxxx",
+  "track": {
+    "id": "t_xxxxxxxx",
+    "kind": "audio",
+    "stream_id": "microphone",
+    "codec": "audio/opus",
+    "publisher_id": "p_xxxxxxxx",
+    "subject": "Alice"
+  },
+  "reason": "track_ended",
+  "unpublished_at": "2026-11-16T10:03:00Z"
+}
+```
+
+`conn_id` 是发布者的 WebRTC 参与者 ID，与 `user_joined.conn_id` 一致。`track_published` 表示房间内出现了一条可订阅轨道；它不表示每个参与者都已经接收该轨道。参与者实际被挂载或移除轨道时，仍通过各自信令通道收到 `track_added` / `track_removed`。
+
+使用方通过控制通道设置某个 WebRTC 参与者的完整订阅列表：
+
+```json
+{
+  "type": "subscriptions",
+  "request_id": "sub_xxxxxxxx",
+  "room_id": "r_xxxxxxxxx",
+  "conn_id": "p_xxxxxxxx",
+  "track_ids": ["t_aaaaaaaa", "t_bbbbbbbb"],
+  "all": false
+}
+```
+
+成功响应：
+
+```json
+{
+  "type": "subscriptions_updated",
+  "request_id": "sub_xxxxxxxx",
+  "room_id": "r_xxxxxxxxx",
+  "conn_id": "p_xxxxxxxx",
+  "track_ids": ["t_aaaaaaaa", "t_bbbbbbbb"],
+  "all": false
+}
+```
+
+失败响应：
+
+```json
+{
+  "type": "error",
+  "request_id": "sub_xxxxxxxx",
+  "room_id": "r_xxxxxxxxx",
+  "conn_id": "p_xxxxxxxx",
+  "error": "WebRTC 参与者不存在或已离开"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `request_id` | 必填，响应原样带回 |
+| `room_id` / `conn_id` | 必填；只能操作当前密钥名下的房间，`conn_id` 必须是该房间在线的 WebRTC 参与者 |
+| `all` | `true` 时订阅当前及未来所有轨道，忽略 `track_ids` |
+| `track_ids` | `all=false` 时生效：只转发这些轨道；空数组表示一条也不订阅；未知 ID 不会报错，会保留为期望状态，匹配的轨道出现时生效 |
+
+规则：
+
+- 未发送过 `subscriptions` 时，默认等同于 `all: true`，与原行为兼容。
+- 每次 `subscriptions` 都会**替换**该参与者的完整订阅状态，不是在原列表上追加。
+- `all: false` 后，新发布的轨道不会自动订阅；需要再次发送包含新 ID 的列表。
+- 订阅状态变化会在参与者完成首个 offer/answer 后应用；若尚未完成，则先保存，首次同步时生效。
+- 订阅只影响该 WebRTC 参与者的下行 RTP 轨道，不影响 WS 帧转发，也不影响该参与者自己发布的轨道。
+- 服务端只执行使用方给出的 ID 列表，不会根据 `kind`、`codec`、发布者或其他业务含义自行选择轨道。使用方可以在自己的后端按任意业务规则生成列表，中继不参与这些判断。
+- 响应中的 `track_ids` 是去重、去掉空白后的列表；`all: true` 时为空。
+- 轨道 ID 来自 `track_published` / `track_added`；使用方重连后可从 `hello.rooms[].connections` 恢复已有参与者，并从 `hello.rooms[].tracks` 获取轨道快照，从而重新下发订阅。
+
+### 3.6 断开与密钥撤销
 
 - 使用方通道断开后，房间保留；新用户加入返回 `503 agent_offline`，已有用户连接不受影响。
 - 使用方重连后会收到包含现有房间的 `hello`。
@@ -437,7 +558,7 @@ X-Repeater-Transport: webrtc
 
 1. 客户端创建 PeerConnection，按需添加发送轨道（`addTrack`）或接收方向（`recvonly` transceiver）。
 2. 客户端发送首个 `offer`；服务端回 `answer`。
-3. 服务端在首个 offer/answer 完成后，把房间内已有轨道挂到该连接，并发送 `track_added`，随后主动发送 `offer`；客户端回 `answer`。
+3. 服务端在首个 offer/answer 完成后，按该连接当前订阅状态（未设置过时默认全部）把房间内已有轨道挂到该连接，并发送 `track_added`，随后主动发送 `offer`；客户端回 `answer`。
 4. 后续任何一方新增轨道都会触发服务端重协商：服务端发送 `offer`，客户端回 `answer`。
 5. ICE 候选可随时双向发送。服务端 offer 在 15 秒内未收到 answer 会关闭该连接。
 
@@ -445,14 +566,14 @@ X-Repeater-Transport: webrtc
 
 - 服务端不会先于客户端发起首个 offer；客户端必须主动发送 offer，否则无法建立媒体连接。
 - 若客户端在服务端 offer 尚未应答时发送新的 offer，服务端会回滚自己的本地 offer、处理客户端 offer，并在信令稳定后重新发起服务端 offer。
-- 房间内所有已发布轨道都会转发给每个其他参与者，当前不提供按轨道订阅/取消订阅的接口；客户端可通过 SDP 的 direction 自行忽略不接收的轨道，或直接不读取该 Track。
+- 默认每个参与者订阅房间内所有已发布轨道；使用方可在控制通道通过 `subscriptions` 为某个参与者设置精确轨道列表或 `all=true`，详见 3.5。中继只执行使用方给出的列表，不按轨道类型或业务含义自行挑选。
 - 每个参与者最多发布 `XR_WEBRTC_MAX_TRACKS_PER_PEER` 条轨道（默认 8，范围 1–32），超限时服务端发送 `error` 并忽略后续轨道。
 
 ### 5.4 媒体转发语义
 
 - 每条发布轨道对应一个房间级轨道；每个订阅者获得独立的 `TrackLocalStaticRTP`，服务端按 RTP 包逐包复制。
 - 只解析 RTP 头用于路由与统计，payload、扩展头内容、编码参数均原样透传；不解码、不转码、不混流、不录制、不落盘。
-- 服务端不实现业务层订阅、发言权、静音或内容规则；这些由使用方与用户自行约定。
+- 中继只提供轨道级订阅原语，不实现发言权、静音、角色或内容规则；某条轨道是否转发由使用方通过 `subscriptions` 决定，与 `kind`、`codec`、发布者无关。
 - 订阅者发送的 PLI/FIR 会转发给发布者以请求关键帧，服务端不做关键帧缓存。
 - 未知轨道/未知信令类型会被忽略；非法 JSON 或无效 SDP 会返回 `error`。
 - 媒体数据只在 PeerConnection 的 UDP 通道传输，不经过信令 WebSocket，也不经过使用方通道。

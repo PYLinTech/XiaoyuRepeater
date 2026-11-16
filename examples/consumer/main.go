@@ -282,7 +282,7 @@ func runAgent(ctx context.Context, endpoint string, opts options, room createdRo
 			log.Printf("中继握手完成：协议 v%d，密钥「%s」，已有 %d 个房间",
 				hello.Protocol, hello.KeyName, len(hello.Rooms))
 			for _, ref := range hello.Rooms {
-				log.Printf("  - 房间 %s「%s」%d 位用户", ref.ID, ref.Name, ref.Participants)
+				log.Printf("  - 房间 %s「%s」%d 位在线，%d 条轨道", ref.ID, ref.Name, len(ref.Connections), len(ref.Tracks))
 			}
 		case protocol.TypeAuthRequest:
 			var req protocol.AuthRequest
@@ -300,6 +300,32 @@ func runAgent(ctx context.Context, endpoint string, opts options, room createdRo
 			}
 			if err := writeJSON(resp); err != nil {
 				return fmt.Errorf("发送鉴权结果失败：%w", err)
+			}
+		case protocol.TypeTrackPublished:
+			var event protocol.TrackPublished
+			if json.Unmarshal(data, &event) == nil {
+				log.Printf("轨道已发布：%s（%s，%s，发布者「%s」，房间「%s」）",
+					event.Track.ID, event.Track.Kind, event.Track.Codec, event.Track.Subject, event.RoomName)
+			}
+		case protocol.TypeTrackUnpublished:
+			var event protocol.TrackUnpublished
+			if json.Unmarshal(data, &event) == nil {
+				log.Printf("轨道已结束：%s（发布者「%s」，房间「%s」，原因 %s）",
+					event.Track.ID, event.Track.Subject, event.RoomName, event.Reason)
+			}
+		case protocol.TypeSubscriptionsUpdated:
+			var event protocol.SubscriptionsUpdate
+			if json.Unmarshal(data, &event) == nil {
+				if event.All {
+					log.Printf("订阅已更新：%s 订阅全部轨道", event.ConnID)
+				} else {
+					log.Printf("订阅已更新：%s 订阅 %d 条轨道", event.ConnID, len(event.TrackIDs))
+				}
+			}
+		case protocol.TypeError:
+			var event protocol.AgentError
+			if json.Unmarshal(data, &event) == nil {
+				log.Printf("中继返回错误（请求 %s）：%s", event.RequestID, event.Error)
 			}
 		case protocol.TypeUserJoined:
 			var event protocol.UserJoined

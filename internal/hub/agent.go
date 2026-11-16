@@ -142,6 +142,13 @@ func (a *Agent) readLoop() {
 				continue
 			}
 			a.deliverAuth(resp)
+		case protocol.TypeSubscriptions:
+			var cmd protocol.SubscriptionsCommand
+			if err := json.Unmarshal(raw, &cmd); err != nil {
+				a.hub.log.Warn("解析订阅命令失败", "error", err, "agent_id", a.id)
+				continue
+			}
+			a.handleSubscriptions(cmd)
 		case protocol.TypePing:
 			a.sendJSON(protocol.Pong{Type: protocol.TypePong, Time: time.Now().UTC()})
 		case protocol.TypePong:
@@ -149,6 +156,59 @@ func (a *Agent) readLoop() {
 			a.hub.log.Debug("忽略未知使用方消息", "type", envelope.Type, "agent_id", a.id)
 		}
 	}
+}
+
+func (a *Agent) handleSubscriptions(cmd protocol.SubscriptionsCommand) {
+	if cmd.RequestID == "" {
+		a.sendCommandError(cmd, "request_id 不能为空")
+		return
+	}
+	if cmd.RoomID == "" || cmd.ConnID == "" {
+		a.sendCommandError(cmd, "room_id 和 conn_id 不能为空")
+		return
+	}
+
+	a.hub.mu.RLock()
+	room := a.hub.rooms[cmd.RoomID]
+	owned := room != nil && room.KeyID == a.keyID
+	a.hub.mu.RUnlock()
+	if !owned {
+		a.sendCommandError(cmd, "房间不存在或不属于当前密钥")
+		return
+	}
+	if room.isClosed() {
+		a.sendCommandError(cmd, "房间已关闭")
+		return
+	}
+	peer := room.peerByID(cmd.ConnID)
+	if peer == nil || peer.isClosed() {
+		a.sendCommandError(cmd, "WebRTC 参与者不存在或已离开")
+		return
+	}
+
+	trackIDs, ok := peer.setSubscriptions(cmd.TrackIDs, cmd.All)
+	if !ok {
+		a.sendCommandError(cmd, "WebRTC 参与者已断开")
+		return
+	}
+	a.sendJSON(protocol.SubscriptionsUpdate{
+		Type:      protocol.TypeSubscriptionsUpdated,
+		RequestID: cmd.RequestID,
+		RoomID:    cmd.RoomID,
+		ConnID:    cmd.ConnID,
+		TrackIDs:  trackIDs,
+		All:       cmd.All,
+	})
+}
+
+func (a *Agent) sendCommandError(cmd protocol.SubscriptionsCommand, message string) {
+	a.sendJSON(protocol.AgentError{
+		Type:      protocol.TypeError,
+		RequestID: cmd.RequestID,
+		RoomID:    cmd.RoomID,
+		ConnID:    cmd.ConnID,
+		Error:     message,
+	})
 }
 
 func (a *Agent) deliverAuth(resp protocol.AuthResponse) {

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -184,6 +185,7 @@ type agentHarness struct {
 	closeErr chan error
 	done     chan struct{}
 	policy   func(token string) *protocol.AuthResponse
+	writeMu  sync.Mutex
 }
 
 func newAgentHarness(t *testing.T, tsURL, secret string, policy func(token string) *protocol.AuthResponse) (*agentHarness, protocol.Hello) {
@@ -260,8 +262,13 @@ func (h *agentHarness) readLoop() {
 					resp.Type = protocol.TypeAuthResponse
 					resp.RequestID = req.RequestID
 					payload, _ := json.Marshal(resp)
-					_ = h.ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
-					if err := h.ws.WriteMessage(websocket.TextMessage, payload); err != nil {
+					h.writeMu.Lock()
+					err := h.ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
+					if err == nil {
+						err = h.ws.WriteMessage(websocket.TextMessage, payload)
+					}
+					h.writeMu.Unlock()
+					if err != nil {
 						return
 					}
 				}
@@ -271,6 +278,22 @@ func (h *agentHarness) readLoop() {
 		case h.events <- envelope:
 		default:
 		}
+	}
+}
+
+func (h *agentHarness) sendJSON(t *testing.T, value any) {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal agent command: %v", err)
+	}
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	if err := h.ws.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set agent write deadline: %v", err)
+	}
+	if err := h.ws.WriteMessage(websocket.TextMessage, raw); err != nil {
+		t.Fatalf("write agent command: %v", err)
 	}
 }
 

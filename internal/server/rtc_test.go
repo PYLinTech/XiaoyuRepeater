@@ -35,6 +35,7 @@ type rtcClient struct {
 	answers    chan string
 	errors     chan string
 	tracks     chan *webrtc.TrackRemote
+	added      chan protocol.RTCTrack
 	removed    chan protocol.RTCTrack
 	closeErr   chan error
 	connected  chan struct{}
@@ -72,6 +73,7 @@ func dialRTC(t *testing.T, tsURL, roomID, token string) (*rtcClient, int, []byte
 		answers:   make(chan string, 16),
 		errors:    make(chan string, 16),
 		tracks:    make(chan *webrtc.TrackRemote, 8),
+		added:     make(chan protocol.RTCTrack, 8),
 		removed:   make(chan protocol.RTCTrack, 8),
 		closeErr:  make(chan error, 1),
 		connected: make(chan struct{}),
@@ -166,6 +168,13 @@ func (c *rtcClient) readLoop() {
 		case protocol.TypeICE:
 			if msg.Candidate != nil {
 				c.addICE(msg.Candidate)
+			}
+		case protocol.TypeTrackAdded:
+			if msg.Track != nil {
+				select {
+				case c.added <- *msg.Track:
+				default:
+				}
 			}
 		case protocol.TypeTrackRemoved:
 			if msg.Track != nil {
@@ -291,6 +300,59 @@ func (c *rtcClient) waitConnected(timeout time.Duration) {
 	}
 }
 
+func (c *rtcClient) waitAdded(timeout time.Duration) protocol.RTCTrack {
+	c.t.Helper()
+	select {
+	case track := <-c.added:
+		return track
+	case msg := <-c.errors:
+		c.t.Fatalf("%s: server signaling error: %s", c.name, msg)
+	case <-time.After(timeout):
+		c.t.Fatalf("%s: timed out waiting for track_added", c.name)
+	}
+	return protocol.RTCTrack{}
+}
+
+func (c *rtcClient) waitRemoved(timeout time.Duration) protocol.RTCTrack {
+	c.t.Helper()
+	select {
+	case track := <-c.removed:
+		return track
+	case msg := <-c.errors:
+		c.t.Fatalf("%s: server signaling error: %s", c.name, msg)
+	case <-time.After(timeout):
+		c.t.Fatalf("%s: timed out waiting for track_removed", c.name)
+	}
+	return protocol.RTCTrack{}
+}
+
+func (c *rtcClient) waitTrack(timeout time.Duration) *webrtc.TrackRemote {
+	c.t.Helper()
+	select {
+	case track := <-c.tracks:
+		return track
+	case msg := <-c.errors:
+		c.t.Fatalf("%s: server signaling error: %s", c.name, msg)
+	case <-time.After(timeout):
+		c.t.Fatalf("%s: timed out waiting for remote track", c.name)
+	}
+	return nil
+}
+
+func (c *rtcClient) expectPayload(track *webrtc.TrackRemote, want []byte, timeout time.Duration) {
+	c.t.Helper()
+	_ = track.SetReadDeadline(time.Now().Add(timeout))
+	for {
+		packet, _, err := track.ReadRTP()
+		if err != nil {
+			c.t.Fatalf("%s: read rtp from %s: %v", c.name, track.ID(), err)
+		}
+		if bytes.Equal(packet.Payload, want) {
+			return
+		}
+	}
+}
+
 func (c *rtcClient) waitCloseCode(code int, timeout time.Duration) {
 	c.t.Helper()
 	select {
@@ -305,15 +367,76 @@ func (c *rtcClient) waitCloseCode(code int, timeout time.Duration) {
 
 func opusTrack(t *testing.T) *webrtc.TrackLocalStaticRTP {
 	t.Helper()
+	return audioTrackNamed(t, "audio", "microphone")
+}
+
+func audioTrackNamed(t *testing.T, id, streamID string) *webrtc.TrackLocalStaticRTP {
+	t.Helper()
 	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
 		MimeType:  webrtc.MimeTypeOpus,
 		ClockRate: 48000,
 		Channels:  2,
-	}, "audio", "microphone")
+	}, id, streamID)
 	if err != nil {
-		t.Fatalf("new opus track: %v", err)
+		t.Fatalf("new opus track %q: %v", id, err)
 	}
 	return track
+}
+
+func videoTrack(t *testing.T, id, streamID string) *webrtc.TrackLocalStaticRTP {
+	t.Helper()
+	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
+		MimeType:  webrtc.MimeTypeVP8,
+		ClockRate: 90000,
+	}, id, streamID)
+	if err != nil {
+		t.Fatalf("new video track %q: %v", id, err)
+	}
+	return track
+}
+
+func writeTrackRTP(track *webrtc.TrackLocalStaticRTP, payload []byte, payloadType uint8, step uint32) chan struct{} {
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		seq := uint16(1)
+		for timestamp := uint32(0); ; timestamp += step {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				_ = track.WriteRTP(&rtp.Packet{
+					Header: rtp.Header{
+						Version:        2,
+						PayloadType:    payloadType,
+						SequenceNumber: seq,
+						Timestamp:      timestamp,
+						SSRC:           0x13572468,
+						Marker:         true,
+					},
+					Payload: payload,
+				})
+				seq++
+			}
+		}
+	}()
+	return stop
+}
+
+func trackFromEvent(t *testing.T, event map[string]any) protocol.RTCTrack {
+	t.Helper()
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal track event: %v", err)
+	}
+	var msg struct {
+		Track protocol.RTCTrack `json:"track"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("decode track event: %v (%s)", err, raw)
+	}
+	return msg.Track
 }
 
 func TestWebRTCSFURelaysRTP(t *testing.T) {
@@ -344,31 +467,7 @@ func TestWebRTCSFURelaysRTP(t *testing.T) {
 	}
 
 	payload := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03}
-	stopWriter := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		seq := uint16(1)
-		for timestamp := uint32(0); ; timestamp += 960 {
-			select {
-			case <-stopWriter:
-				return
-			case <-ticker.C:
-				_ = publishTrack.WriteRTP(&rtp.Packet{
-					Header: rtp.Header{
-						Version:        2,
-						PayloadType:    111,
-						SequenceNumber: seq,
-						Timestamp:      timestamp,
-						SSRC:           0x13572468,
-						Marker:         true,
-					},
-					Payload: payload,
-				})
-				seq++
-			}
-		}
-	}()
+	stopWriter := writeTrackRTP(publishTrack, payload, 111, 960)
 	defer close(stopWriter)
 
 	time.Sleep(200 * time.Millisecond)
@@ -386,27 +485,8 @@ func TestWebRTCSFURelaysRTP(t *testing.T) {
 	subscriber.answerOffer(serverOffer)
 	subscriber.waitConnected(20 * time.Second)
 
-	var remote *webrtc.TrackRemote
-	select {
-	case remote = <-subscriber.tracks:
-	case <-time.After(15 * time.Second):
-		t.Fatalf("timed out waiting for subscriber track")
-	}
-	_ = remote.SetReadDeadline(time.Now().Add(15 * time.Second))
-	received := false
-	for i := 0; i < 20; i++ {
-		pkt, _, err := remote.ReadRTP()
-		if err != nil {
-			break
-		}
-		if bytes.Equal(pkt.Payload, payload) {
-			received = true
-			break
-		}
-	}
-	if !received {
-		t.Fatalf("subscriber did not receive the original RTP payload")
-	}
+	remote := subscriber.waitTrack(15 * time.Second)
+	subscriber.expectPayload(remote, payload, 15*time.Second)
 	select {
 	case track := <-publisher.tracks:
 		t.Fatalf("publisher received its own track %q", track.ID())
@@ -470,30 +550,10 @@ func TestWebRTCTrackRemoval(t *testing.T) {
 	publisher.sendOffer()
 	publisher.waitAnswer(15 * time.Second)
 	publisher.waitConnected(20 * time.Second)
-	stopWriter := make(chan struct{})
+	stopWriter := writeTrackRTP(publishTrack, []byte{0xde, 0xad, 0xbe, 0xef}, 111, 960)
 	defer close(stopWriter)
-	go func() {
-		ticker := time.NewTicker(20 * time.Millisecond)
-		defer ticker.Stop()
-		for seq := uint16(1); ; seq++ {
-			select {
-			case <-stopWriter:
-				return
-			case <-ticker.C:
-				_ = publishTrack.WriteRTP(&rtp.Packet{
-					Header: rtp.Header{
-						Version:        2,
-						PayloadType:    111,
-						SequenceNumber: seq,
-						Timestamp:      uint32(seq) * 960,
-						SSRC:           0x13572468,
-						Marker:         true,
-					},
-					Payload: []byte{0xde, 0xad, 0xbe, 0xef},
-				})
-			}
-		}
-	}()
+	publishedEvent := agent.waitEvent(t, protocol.TypeTrackPublished, 15*time.Second)
+	publishedInfo := trackFromEvent(t, publishedEvent)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var published struct {
@@ -523,11 +583,7 @@ func TestWebRTCTrackRemoval(t *testing.T) {
 	subscriber.waitAnswer(15 * time.Second)
 	subscriber.answerOffer(subscriber.waitOffer(15 * time.Second))
 	subscriber.waitConnected(20 * time.Second)
-	select {
-	case <-subscriber.tracks:
-	case <-time.After(15 * time.Second):
-		t.Fatalf("timed out waiting for subscriber track")
-	}
+	subscriber.waitTrack(15 * time.Second)
 
 	if err := publisher.pc.RemoveTrack(sender); err != nil {
 		t.Fatalf("remove publisher track: %v", err)
@@ -535,13 +591,9 @@ func TestWebRTCTrackRemoval(t *testing.T) {
 	publisher.sendOffer()
 	publisher.waitAnswer(15 * time.Second)
 
-	select {
-	case info := <-subscriber.removed:
-		if info.Kind != "audio" {
-			t.Fatalf("removed track kind = %q", info.Kind)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatalf("timed out waiting for track_removed")
+	removedInfo := subscriber.waitRemoved(20 * time.Second)
+	if removedInfo.Kind != "audio" {
+		t.Fatalf("removed track kind = %q", removedInfo.Kind)
 	}
 
 	var overview struct {
@@ -554,12 +606,202 @@ func TestWebRTCTrackRemoval(t *testing.T) {
 	if overview.Stats.RTCTracks != 0 {
 		t.Fatalf("rtc tracks after removal = %d", overview.Stats.RTCTracks)
 	}
+	unpublished := agent.waitEvent(t, protocol.TypeTrackUnpublished, 10*time.Second)
+	unpublishedInfo := trackFromEvent(t, unpublished)
+	if unpublishedInfo.ID != publishedInfo.ID {
+		t.Fatalf("unpublished track = %q, want %q", unpublishedInfo.ID, publishedInfo.ID)
+	}
+	if unpublished["reason"] != "track_ended" {
+		t.Fatalf("unpublished reason = %v", unpublished["reason"])
+	}
 
 	status, body = env.adminJSON(http.MethodDelete, "/api/admin/rooms/"+room.ID, nil, nil)
 	if status != http.StatusOK {
 		t.Fatalf("close room status=%d body=%s", status, body)
 	}
 	agent.waitEvent(t, protocol.TypeRoomClosed, 5*time.Second)
+}
+
+func (h *agentHarness) applySubscriptions(t *testing.T, cmd protocol.SubscriptionsCommand) {
+	t.Helper()
+	cmd.Type = protocol.TypeSubscriptions
+	h.sendJSON(t, cmd)
+	ack := h.waitEvent(t, protocol.TypeSubscriptionsUpdated, 5*time.Second)
+	if ack["request_id"] != cmd.RequestID || ack["conn_id"] != cmd.ConnID || ack["all"] != cmd.All {
+		t.Fatalf("subscription ack = %+v, want request %+v", ack, cmd)
+	}
+}
+
+func TestWebRTCSubscriptions(t *testing.T) {
+	env := newTestEnv(t, func(cfg *config.Config) {
+		cfg.WebRTCEnabled = true
+		cfg.WebRTCUDPPortMin = 54000
+		cfg.WebRTCUDPPortMax = 54099
+		cfg.WebRTCMaxTracksPerPeer = 4
+	})
+	agent, _ := newAgentHarness(t, env.ts.URL, env.secret, allowTokens("ok-"))
+	room := env.createRoom("WebRTC 订阅", 3)
+
+	publisher := mustDialRTC(t, env.ts.URL, room.ID, "ok-publisher")
+	agent.waitEvent(t, protocol.TypeAuthRequest, 5*time.Second)
+	audio := audioTrackNamed(t, "audio", "mic")
+	video := videoTrack(t, "video", "camera")
+	if _, err := publisher.pc.AddTrack(audio); err != nil {
+		t.Fatalf("add audio track: %v", err)
+	}
+	if _, err := publisher.pc.AddTrack(video); err != nil {
+		t.Fatalf("add video track: %v", err)
+	}
+	publisher.sendOffer()
+	publisher.waitAnswer(15 * time.Second)
+	publisher.waitConnected(20 * time.Second)
+
+	audioPayload := []byte{0xaa, 0x01, 0x02, 0x03}
+	videoPayload := []byte{0xbb, 0x04, 0x05, 0x06}
+	stopAudio := writeTrackRTP(audio, audioPayload, 111, 960)
+	defer close(stopAudio)
+	stopVideo := writeTrackRTP(video, videoPayload, 96, 9000)
+	defer close(stopVideo)
+
+	published := map[string]protocol.RTCTrack{}
+	for len(published) < 2 {
+		event := agent.waitEvent(t, protocol.TypeTrackPublished, 15*time.Second)
+		track := trackFromEvent(t, event)
+		published[track.StreamID] = track
+	}
+	audioInfo, ok := published["mic"]
+	if !ok {
+		t.Fatalf("audio track event missing: %+v", published)
+	}
+	videoInfo, ok := published["camera"]
+	if !ok {
+		t.Fatalf("video track event missing: %+v", published)
+	}
+	if audioInfo.Kind != "audio" || videoInfo.Kind != "video" {
+		t.Fatalf("track kinds = audio:%q video:%q", audioInfo.Kind, videoInfo.Kind)
+	}
+
+	subscriber := mustDialRTC(t, env.ts.URL, room.ID, "ok-subscriber")
+	agent.waitEvent(t, protocol.TypeAuthRequest, 5*time.Second)
+	joined := agent.waitEvent(t, protocol.TypeUserJoined, 5*time.Second)
+	connID, _ := joined["conn_id"].(string)
+	if connID == "" {
+		t.Fatalf("user_joined missing conn_id: %+v", joined)
+	}
+
+	agent.applySubscriptions(t, protocol.SubscriptionsCommand{
+		RequestID: "sub-audio",
+		RoomID:    room.ID,
+		ConnID:    connID,
+		TrackIDs:  []string{audioInfo.ID},
+	})
+
+	if _, err := subscriber.pc.AddTransceiverFromKind(
+		webrtc.RTPCodecTypeAudio,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
+	); err != nil {
+		t.Fatalf("add recvonly audio transceiver: %v", err)
+	}
+	subscriber.sendOffer()
+	subscriber.waitAnswer(15 * time.Second)
+	subscriber.answerOffer(subscriber.waitOffer(15 * time.Second))
+	subscriber.waitConnected(20 * time.Second)
+
+	added := subscriber.waitAdded(15 * time.Second)
+	if added.ID != audioInfo.ID {
+		t.Fatalf("first attached track = %q, want %q", added.ID, audioInfo.ID)
+	}
+	remote := subscriber.waitTrack(15 * time.Second)
+	if remote.ID() != audioInfo.ID {
+		t.Fatalf("first remote track = %q, want %q", remote.ID(), audioInfo.ID)
+	}
+	subscriber.expectPayload(remote, audioPayload, 15*time.Second)
+	select {
+	case track := <-subscriber.tracks:
+		t.Fatalf("received unsubscribed track %q", track.ID())
+	case <-time.After(time.Second):
+	}
+
+	agent.applySubscriptions(t, protocol.SubscriptionsCommand{
+		RequestID: "sub-video",
+		RoomID:    room.ID,
+		ConnID:    connID,
+		TrackIDs:  []string{videoInfo.ID},
+	})
+	if removed := subscriber.waitRemoved(15 * time.Second); removed.ID != audioInfo.ID {
+		t.Fatalf("removed track = %q, want %q", removed.ID, audioInfo.ID)
+	}
+	if added := subscriber.waitAdded(15 * time.Second); added.ID != videoInfo.ID {
+		t.Fatalf("attached track = %q, want %q", added.ID, videoInfo.ID)
+	}
+	subscriber.answerOffer(subscriber.waitOffer(15 * time.Second))
+	remote = subscriber.waitTrack(15 * time.Second)
+	if remote.ID() != videoInfo.ID {
+		t.Fatalf("remote track = %q, want %q", remote.ID(), videoInfo.ID)
+	}
+	subscriber.expectPayload(remote, videoPayload, 15*time.Second)
+
+	agent.applySubscriptions(t, protocol.SubscriptionsCommand{
+		RequestID: "sub-all",
+		RoomID:    room.ID,
+		ConnID:    connID,
+		All:       true,
+	})
+	if added := subscriber.waitAdded(15 * time.Second); added.ID != audioInfo.ID {
+		t.Fatalf("re-attached track = %q, want %q", added.ID, audioInfo.ID)
+	}
+	subscriber.answerOffer(subscriber.waitOffer(15 * time.Second))
+
+	agent.applySubscriptions(t, protocol.SubscriptionsCommand{
+		RequestID: "sub-none",
+		RoomID:    room.ID,
+		ConnID:    connID,
+		TrackIDs:  []string{},
+	})
+	removedIDs := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		removed := subscriber.waitRemoved(15 * time.Second)
+		removedIDs[removed.ID] = true
+	}
+	if !removedIDs[audioInfo.ID] || !removedIDs[videoInfo.ID] {
+		t.Fatalf("removed tracks = %+v, want audio and video", removedIDs)
+	}
+	subscriber.answerOffer(subscriber.waitOffer(15 * time.Second))
+
+	agent.sendJSON(t, protocol.SubscriptionsCommand{
+		Type:      protocol.TypeSubscriptions,
+		RequestID: "sub-missing",
+		RoomID:    room.ID,
+		ConnID:    "p_missing",
+	})
+	event := agent.waitEvent(t, protocol.TypeError, 5*time.Second)
+	if event["error"] == "" {
+		t.Fatalf("missing peer error = %+v", event)
+	}
+
+	_, hello := newAgentHarness(t, env.ts.URL, env.secret, allowTokens("ok-"))
+	if len(hello.Rooms) != 1 || len(hello.Rooms[0].Tracks) != 2 {
+		t.Fatalf("hello tracks = %+v", hello.Rooms)
+	}
+	helloTrackIDs := map[string]bool{}
+	for _, track := range hello.Rooms[0].Tracks {
+		helloTrackIDs[track.ID] = true
+	}
+	if !helloTrackIDs[audioInfo.ID] || !helloTrackIDs[videoInfo.ID] {
+		t.Fatalf("hello track IDs = %+v", helloTrackIDs)
+	}
+	if len(hello.Rooms[0].Connections) != 2 {
+		t.Fatalf("hello connections = %+v", hello.Rooms[0].Connections)
+	}
+	helloRTCConns := map[string]bool{}
+	for _, conn := range hello.Rooms[0].Connections {
+		if conn.Transport == protocol.TransportWebRTC {
+			helloRTCConns[conn.ConnID] = true
+		}
+	}
+	if len(helloRTCConns) != 2 || !helloRTCConns[connID] {
+		t.Fatalf("hello WebRTC connections = %+v", hello.Rooms[0].Connections)
+	}
 }
 
 func TestWebRTCDisabled(t *testing.T) {

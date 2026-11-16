@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,6 +66,10 @@ type RTCPeer struct {
 	tracksMu sync.Mutex
 	outbound map[string]*outboundTrack
 
+	subMu         sync.Mutex
+	autoSubscribe bool
+	wanted        map[string]struct{}
+
 	metaMu  sync.Mutex
 	pubKeys map[string]struct{}
 }
@@ -114,19 +119,21 @@ func newRTCPeer(h *Hub, room *Room, ws *websocket.Conn, decision Decision, remot
 		return nil, err
 	}
 	p := &RTCPeer{
-		ID:         newID("p_", 6),
-		Subject:    decision.Subject,
-		RemoteAddr: remoteAddr,
-		UserAgent:  userAgent,
-		JoinedAt:   time.Now().UTC(),
-		hub:        h,
-		room:       room,
-		ws:         ws,
-		pc:         pc,
-		out:        make(chan []byte, peerQueueSize),
-		done:       make(chan struct{}),
-		outbound:   make(map[string]*outboundTrack),
-		pubKeys:    make(map[string]struct{}),
+		ID:            newID("p_", 6),
+		Subject:       decision.Subject,
+		RemoteAddr:    remoteAddr,
+		UserAgent:     userAgent,
+		JoinedAt:      time.Now().UTC(),
+		hub:           h,
+		room:          room,
+		ws:            ws,
+		pc:            pc,
+		out:           make(chan []byte, peerQueueSize),
+		done:          make(chan struct{}),
+		outbound:      make(map[string]*outboundTrack),
+		autoSubscribe: true,
+		wanted:        make(map[string]struct{}),
+		pubKeys:       make(map[string]struct{}),
 	}
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -471,12 +478,109 @@ func (p *RTCPeer) syncPublishedTracks() {
 		return
 	}
 	for _, pub := range p.room.publishedSnapshot() {
-		if pub.owner == p || p.isClosed() {
+		p.attachIfWanted(pub)
+	}
+}
+
+func (p *RTCPeer) isInitialSynced() bool {
+	p.negMu.Lock()
+	defer p.negMu.Unlock()
+	return p.initialSynced
+}
+
+func (p *RTCPeer) wantsLocked(pub *publishedTrack) bool {
+	if pub.owner == p {
+		return false
+	}
+	if p.autoSubscribe {
+		return true
+	}
+	_, ok := p.wanted[pub.key]
+	return ok
+}
+
+func (p *RTCPeer) attachWantedLocked(pub *publishedTrack) {
+	if !p.wantsLocked(pub) {
+		return
+	}
+	p.attachPublished(pub)
+}
+
+func (p *RTCPeer) attachIfWanted(pub *publishedTrack) {
+	if p.isClosed() {
+		return
+	}
+	p.subMu.Lock()
+	defer p.subMu.Unlock()
+	if p.isClosed() || !p.isInitialSynced() {
+		return
+	}
+	p.attachWantedLocked(pub)
+}
+
+// setSubscriptions replaces the participant's complete subscription state.
+// The relay only executes the consumer's list; it never derives subscriptions
+// from track kind, publisher, or any other business meaning.
+func (p *RTCPeer) setSubscriptions(trackIDs []string, all bool) ([]string, bool) {
+	normalized := []string{}
+	if !all {
+		normalized = normalizeTrackIDs(trackIDs)
+	}
+
+	p.subMu.Lock()
+	defer p.subMu.Unlock()
+	if p.isClosed() {
+		return normalized, false
+	}
+
+	p.autoSubscribe = all
+	p.wanted = nil
+	if !all {
+		p.wanted = make(map[string]struct{}, len(normalized))
+		for _, id := range normalized {
+			p.wanted[id] = struct{}{}
+		}
+	}
+
+	if !p.isInitialSynced() {
+		return normalized, true
+	}
+
+	if !all {
+		p.tracksMu.Lock()
+		stale := make([]string, 0, len(p.outbound))
+		for key := range p.outbound {
+			if _, keep := p.wanted[key]; !keep {
+				stale = append(stale, key)
+			}
+		}
+		p.tracksMu.Unlock()
+		for _, key := range stale {
+			p.removeOutbound(key)
+		}
+	}
+
+	for _, pub := range p.room.publishedSnapshot() {
+		p.attachWantedLocked(pub)
+	}
+	return normalized, true
+}
+
+func normalizeTrackIDs(trackIDs []string) []string {
+	seen := make(map[string]struct{}, len(trackIDs))
+	out := make([]string, 0, len(trackIDs))
+	for _, id := range trackIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
 			continue
 		}
-		p.attachPublished(pub)
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
 	}
-	p.requestNegotiation()
+	return out
 }
 
 func (p *RTCPeer) handleTrack(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
@@ -512,6 +616,14 @@ func (p *RTCPeer) handleTrack(remote *webrtc.TrackRemote, receiver *webrtc.RTPRe
 		p.removePublishedKey(key)
 		return
 	}
+	p.hub.notifyAgent(p.room.KeyID, protocol.TrackPublished{
+		Type:        protocol.TypeTrackPublished,
+		RoomID:      p.room.ID,
+		RoomName:    p.room.Name,
+		ConnID:      p.ID,
+		Track:       info,
+		PublishedAt: time.Now().UTC(),
+	})
 	go pub.readLoop()
 	go func() {
 		for {
@@ -521,9 +633,10 @@ func (p *RTCPeer) handleTrack(remote *webrtc.TrackRemote, receiver *webrtc.RTPRe
 		}
 	}()
 	for _, peer := range p.room.peersSnapshot() {
-		if peer != p {
-			peer.attachPublished(pub)
+		if peer == p {
+			continue
 		}
+		peer.attachIfWanted(pub)
 	}
 	p.hub.log.Info("WebRTC 轨道已发布",
 		"room_id", p.room.ID, "peer_id", p.ID, "track_id", key, "kind", info.Kind, "codec", info.Codec)
@@ -638,6 +751,15 @@ func (h *Hub) removePublishedTrack(t *publishedTrack, reason string) {
 		return
 	}
 	t.room.unpublish(t.key)
+	t.owner.hub.notifyAgent(t.room.KeyID, protocol.TrackUnpublished{
+		Type:          protocol.TypeTrackUnpublished,
+		RoomID:        t.room.ID,
+		RoomName:      t.room.Name,
+		ConnID:        t.owner.ID,
+		Track:         t.info,
+		Reason:        reason,
+		UnpublishedAt: time.Now().UTC(),
+	})
 	t.subsMu.Lock()
 	peers := make([]*RTCPeer, 0, len(t.subs))
 	for peer := range t.subs {

@@ -1,9 +1,12 @@
 package hub
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"xiaoyurepeater/internal/protocol"
 )
 
 type Room struct {
@@ -74,12 +77,6 @@ func (r *Room) removePeer(id string) bool {
 	return true
 }
 
-func (r *Room) participantCount() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.participants) + len(r.peers)
-}
-
 func (r *Room) peersSnapshot() []*RTCPeer {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -88,6 +85,12 @@ func (r *Room) peersSnapshot() []*RTCPeer {
 		out = append(out, p)
 	}
 	return out
+}
+
+func (r *Room) peerByID(id string) *RTCPeer {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.peers[id]
 }
 
 func (r *Room) isFull() bool {
@@ -163,6 +166,43 @@ func (r *Room) publishedCount() int {
 	return len(r.published)
 }
 
+func (r *Room) trackInfos() []protocol.RTCTrack {
+	tracks := r.publishedSnapshot()
+	out := make([]protocol.RTCTrack, 0, len(tracks))
+	for _, track := range tracks {
+		out = append(out, track.info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (r *Room) connectionRefs() []protocol.ConnectionRef {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]protocol.ConnectionRef, 0, len(r.participants)+len(r.peers))
+	for _, p := range r.participants {
+		out = append(out, protocol.ConnectionRef{
+			ConnID:    p.ID,
+			Transport: protocol.TransportWebSocket,
+			Subject:   p.Subject,
+		})
+	}
+	for _, p := range r.peers {
+		out = append(out, protocol.ConnectionRef{
+			ConnID:    p.ID,
+			Transport: protocol.TransportWebRTC,
+			Subject:   p.Subject,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Subject != out[j].Subject {
+			return out[i].Subject < out[j].Subject
+		}
+		return out[i].ConnID < out[j].ConnID
+	})
+	return out
+}
+
 func (r *Room) snapshot(agentOnline bool) RoomInfo {
 	r.mu.RLock()
 	participants := make([]ParticipantInfo, 0, len(r.participants)+len(r.peers))
@@ -170,7 +210,7 @@ func (r *Room) snapshot(agentOnline bool) RoomInfo {
 		participants = append(participants, ParticipantInfo{
 			ID:         p.ID,
 			Subject:    p.Subject,
-			Transport:  "ws",
+			Transport:  protocol.TransportWebSocket,
 			RemoteAddr: p.RemoteAddr,
 			UserAgent:  p.UserAgent,
 			JoinedAt:   p.JoinedAt,
@@ -180,7 +220,7 @@ func (r *Room) snapshot(agentOnline bool) RoomInfo {
 		participants = append(participants, ParticipantInfo{
 			ID:         p.ID,
 			Subject:    p.Subject,
-			Transport:  "webrtc",
+			Transport:  protocol.TransportWebRTC,
 			Tracks:     p.publishedCount(),
 			RemoteAddr: p.RemoteAddr,
 			UserAgent:  p.UserAgent,

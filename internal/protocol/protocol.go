@@ -14,13 +14,17 @@ const (
 	TypePing         = "ping"
 	TypePong         = "pong"
 
-	TypeOffer        = "offer"
-	TypeAnswer       = "answer"
-	TypeICE          = "ice"
-	TypeBye          = "bye"
-	TypeError        = "error"
-	TypeTrackAdded   = "track_added"
-	TypeTrackRemoved = "track_removed"
+	TypeOffer                = "offer"
+	TypeAnswer               = "answer"
+	TypeICE                  = "ice"
+	TypeBye                  = "bye"
+	TypeError                = "error"
+	TypeTrackAdded           = "track_added"
+	TypeTrackRemoved         = "track_removed"
+	TypeTrackPublished       = "track_published"
+	TypeTrackUnpublished     = "track_unpublished"
+	TypeSubscriptions        = "subscriptions"
+	TypeSubscriptionsUpdated = "subscriptions_updated"
 )
 
 const (
@@ -29,10 +33,21 @@ const (
 )
 
 type RoomRef struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Participants int       `json:"participants"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID           string          `json:"id"`
+	Name         string          `json:"name"`
+	Participants int             `json:"participants"` // 兼容字段，等于 Connections 数量
+	CreatedAt    time.Time       `json:"created_at"`
+	Connections  []ConnectionRef `json:"connections,omitempty"`
+	Tracks       []RTCTrack      `json:"tracks,omitempty"`
+}
+
+// ConnectionRef is the neutral per-connection snapshot sent to the owning
+// consumer after reconnect. It lets the consumer address existing WebRTC
+// participants for subscription commands without exposing any payload.
+type ConnectionRef struct {
+	ConnID    string `json:"conn_id"`
+	Transport string `json:"transport"`
+	Subject   string `json:"subject"`
 }
 
 type Hello struct {
@@ -145,4 +160,56 @@ type RTCTrack struct {
 	RID         string `json:"rid,omitempty"`
 	PublisherID string `json:"publisher_id"`
 	Subject     string `json:"subject,omitempty"`
+}
+
+// TrackPublished and TrackUnpublished are control events for the consumer.
+// They describe room-level track metadata; no media bytes pass through the
+// agent channel.
+type TrackPublished struct {
+	Type        string    `json:"type"`
+	RoomID      string    `json:"room_id"`
+	RoomName    string    `json:"room_name"`
+	ConnID      string    `json:"conn_id"`
+	Track       RTCTrack  `json:"track"`
+	PublishedAt time.Time `json:"published_at"`
+}
+
+type TrackUnpublished struct {
+	Type          string    `json:"type"`
+	RoomID        string    `json:"room_id"`
+	RoomName      string    `json:"room_name"`
+	ConnID        string    `json:"conn_id"`
+	Track         RTCTrack  `json:"track"`
+	Reason        string    `json:"reason"`
+	UnpublishedAt time.Time `json:"unpublished_at"`
+}
+
+// SubscriptionsCommand is sent by the consumer to set the complete
+// subscription state of one WebRTC participant. If All is true, the relay
+// forwards every current and future room track and ignores TrackIDs.
+// Otherwise only the listed track IDs are forwarded; an empty list means none.
+type SubscriptionsCommand struct {
+	Type      string   `json:"type"`
+	RequestID string   `json:"request_id"`
+	RoomID    string   `json:"room_id"`
+	ConnID    string   `json:"conn_id"`
+	TrackIDs  []string `json:"track_ids"`
+	All       bool     `json:"all"`
+}
+
+type SubscriptionsUpdate struct {
+	Type      string   `json:"type"`
+	RequestID string   `json:"request_id"`
+	RoomID    string   `json:"room_id"`
+	ConnID    string   `json:"conn_id"`
+	TrackIDs  []string `json:"track_ids"`
+	All       bool     `json:"all"`
+}
+
+type AgentError struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id,omitempty"`
+	RoomID    string `json:"room_id,omitempty"`
+	ConnID    string `json:"conn_id,omitempty"`
+	Error     string `json:"error"`
 }

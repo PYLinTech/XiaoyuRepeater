@@ -463,24 +463,21 @@ func (h *Hub) ServeAgent(ws *websocket.Conn, keyID, keyName, remoteAddr string) 
 	h.agents[keyID] = agent
 	refs := make([]protocol.RoomRef, 0)
 	for _, room := range h.rooms {
-		if room.KeyID == keyID {
-			refs = append(refs, protocol.RoomRef{
-				ID:           room.ID,
-				Name:         room.Name,
-				Participants: room.participantCount(),
-				CreatedAt:    room.CreatedAt,
-			})
+		if room.KeyID != keyID {
+			continue
 		}
+		connections := room.connectionRefs()
+		refs = append(refs, protocol.RoomRef{
+			ID:           room.ID,
+			Name:         room.Name,
+			Participants: len(connections),
+			CreatedAt:    room.CreatedAt,
+			Connections:  connections,
+			Tracks:       room.trackInfos(),
+		})
 	}
-	h.mu.Unlock()
-
-	if old != nil {
-		h.log.Info("使用方重复连接，替换旧连接", "key_id", keyID)
-		old.closeWith(4001, "replaced by new connection")
-		old.failPending(ErrAgentOffline)
-	}
-
-	go agent.writeLoop()
+	// Enqueue hello before releasing the hub lock so no room event can be
+	// delivered ahead of the handshake snapshot.
 	agent.sendJSON(protocol.Hello{
 		Type:       protocol.TypeHello,
 		Protocol:   protocol.Version,
@@ -498,6 +495,15 @@ func (h *Hub) ServeAgent(ws *websocket.Conn, keyID, keyName, remoteAddr string) 
 			MaxTracksPerPeer:     h.cfg.WebRTC.MaxTracksPerPeer,
 		},
 	})
+	h.mu.Unlock()
+
+	if old != nil {
+		h.log.Info("使用方重复连接，替换旧连接", "key_id", keyID)
+		old.closeWith(4001, "replaced by new connection")
+		old.failPending(ErrAgentOffline)
+	}
+
+	go agent.writeLoop()
 	h.events.add("agent_online", fmt.Sprintf("使用方「%s」已连接", keyName), "", "")
 	h.log.Info("使用方已连接", "agent_id", agent.id, "key_id", keyID, "name", keyName, "remote_addr", remoteAddr)
 
