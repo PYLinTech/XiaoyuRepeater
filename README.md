@@ -171,3 +171,9 @@ make test         # Go 测试
 make test-race    # 竞态检测
 make docker       # 构建镜像
 ```
+
+## 许可证
+
+本项目基于 [MIT 许可证](LICENSE) 开源。
+
+Copyright (c) 2026 重庆沛雨霖科技有限公司（PYLinTech）
