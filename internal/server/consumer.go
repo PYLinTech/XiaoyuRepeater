@@ -7,6 +7,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"xiaoyurepeater/internal/hub"
 	"xiaoyurepeater/internal/protocol"
 	"xiaoyurepeater/internal/store"
 )
@@ -73,13 +74,19 @@ func (s *Server) handleConsumerCreateRoom(w http.ResponseWriter, r *http.Request
 	}
 
 	wsPath := "/v1/rooms/" + room.ID + "/ws"
-	s.log.Info("使用方创建房间", "room_id", room.ID, "key_id", key.ID, "name", room.Name)
-	writeJSON(w, http.StatusCreated, map[string]any{
+	rtcPath := "/v1/rooms/" + room.ID + "/webrtc"
+	response := map[string]any{
 		"protocol": protocol.Version,
 		"room":     room,
 		"ws_path":  wsPath,
 		"ws_url":   s.publicWSURL(r, wsPath),
-	})
+	}
+	if s.cfg.WebRTCEnabled {
+		response["webrtc_path"] = rtcPath
+		response["webrtc_url"] = s.publicWSURL(r, rtcPath)
+	}
+	s.log.Info("使用方创建房间", "room_id", room.ID, "key_id", key.ID, "name", room.Name)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) handleConsumerListRooms(w http.ResponseWriter, r *http.Request) {
@@ -147,10 +154,12 @@ func (s *Server) handleUserWS(w http.ResponseWriter, r *http.Request) {
 	query := forwardedQuery(r)
 	headers := forwardedHeaders(r)
 
-	room, decision, hubErr := s.hub.AuthorizeJoin(r.Context(), roomID, remoteAddr, query, headers)
+	room, decision, hubErr := s.hub.AuthorizeJoin(
+		r.Context(), roomID, protocol.TransportWebSocket, remoteAddr, query, headers)
 	if hubErr != nil {
 		s.log.Info("用户加入房间被拒绝",
 			"room_id", roomID,
+			"transport", protocol.TransportWebSocket,
 			"code", hubErr.Code,
 			"remote_addr", remoteAddr,
 			"request_id", w.Header().Get("X-Request-Id"))
@@ -158,6 +167,33 @@ func (s *Server) handleUserWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if serveErr := s.hub.ServeParticipant(w, r, room, decision, remoteAddr); serveErr != nil {
+		writeHubError(w, serveErr)
+	}
+}
+
+func (s *Server) handleUserWebRTC(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.WebRTCEnabled {
+		writeHubError(w, hub.ErrWebRTCUnavailable)
+		return
+	}
+	roomID := r.PathValue("id")
+	remoteAddr := clientIP(r, s.cfg.TrustProxy)
+	query := forwardedQuery(r)
+	headers := forwardedHeaders(r)
+
+	room, decision, hubErr := s.hub.AuthorizeJoin(
+		r.Context(), roomID, protocol.TransportWebRTC, remoteAddr, query, headers)
+	if hubErr != nil {
+		s.log.Info("用户加入房间被拒绝",
+			"room_id", roomID,
+			"transport", protocol.TransportWebRTC,
+			"code", hubErr.Code,
+			"remote_addr", remoteAddr,
+			"request_id", w.Header().Get("X-Request-Id"))
+		writeHubError(w, hubErr)
+		return
+	}
+	if serveErr := s.hub.ServeRTCPeer(w, r, room, decision, remoteAddr); serveErr != nil {
 		writeHubError(w, serveErr)
 	}
 }

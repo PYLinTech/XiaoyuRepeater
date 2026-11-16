@@ -1,8 +1,8 @@
 # XiaoyuRepeater
 
-面向实时场景的通用 WebSocket 中继服务。使用方程序凭 API 密钥创建中转房间，把房间地址分发给自己的用户；用户连接房间时，中继服务通过双向 WebSocket 实时询问使用方程序是否放行，通过后即可加入。
+面向实时场景的通用中继服务。使用方程序凭 API 密钥创建中转房间，把房间地址分发给自己的用户；用户连接房间时，中继服务通过双向 WebSocket 实时询问使用方程序是否放行，通过后即可加入。
 
-数据面只做字节转发：文本帧与二进制帧原样复制给房间内其他连接，不解析、不落盘、不转码，也没有任何业务内容规则。内置 Go 服务端与 Vue 控制台，单个二进制即可部署。
+数据面提供两条可并行的通道：WebSocket 文本/二进制帧原样转发，以及可选的 WebRTC SFU 轨道转发。中继不解析业务内容、不落盘、不转码，也没有任何业务内容规则。内置 Go 服务端与 Vue 控制台，单个二进制即可部署。
 
 ## 适用场景
 
@@ -10,7 +10,7 @@
 - 远程协助 / 远程控制信令与画面转发
 - 其他需要“房间 + 使用方实时鉴权 + 透明转发”的实时应用
 
-中继不包含编解码、混流、录制、内容审核等能力，具体传输内容完全由使用方与用户自行约定。
+WS 通道适合信令、状态同步与任意字节流；WebRTC 通道适合低延迟音视频轨道。中继不包含编解码、混流、录制、内容审核等能力，具体传输内容完全由使用方与用户自行约定。
 
 ## 工作方式
 
@@ -18,19 +18,21 @@
                      控制面（HTTP / WebSocket）
  使用方程序  ── 创建房间、关闭房间 ──────────────┐
      │                                          ▼
-     │  WS /v1/agent（鉴权通道）          ┌──────────────┐
-     └──── auth_request / auth_response ─│  XiaoyuRepeater │
-                                         │   Go 服务端     │
- 用户 A ── WS /v1/rooms/{id}/ws ────────▶│  房间内字节转发  │
- 用户 B ── WS /v1/rooms/{id}/ws ────────▶│                │
-                                         └──────────────┘
+     │  WS /v1/agent（鉴权通道）          ┌───────────────┐
+     └──── auth_request / auth_response ─│ XiaoyuRepeater │
+                                         │   Go 服务端    │
+ 用户 A ── WS /v1/rooms/{id}/ws ────────▶│ WS 帧转发      │
+ 用户 B ── WS /v1/rooms/{id}/ws ────────▶│ RTP 轨道转发   │
+ 用户 C ── WS /v1/rooms/{id}/webrtc ────▶│ （WebRTC SFU） │
+                                         └───────────────┘
                                                 ▲
  管理员 ── 浏览器控制台（Vue）──────────────────┘
 ```
 
 - **控制面**：API 密钥、房间生命周期、加入前鉴权、事件通知。
-- **数据面**：用户与用户之间的 WebSocket 帧转发；使用方程序只参与鉴权，不接收转发内容。
+- **数据面**：WS 用户之间的帧转发；WebRTC 参与者之间的 RTP 轨道转发。使用方程序只参与鉴权与控制事件，不接收转发内容。
 - **鉴权在升级前完成**：未通过时直接返回 HTTP 403/409/503/504，不会建立用户连接。
+- **可选 WebRTC**：默认启用、完全自托管，基于 Pion，不引入外部信令、STUN、TURN 或媒体服务。
 
 ## 快速开始
 
@@ -61,6 +63,8 @@ npx wscat -c 'ws://127.0.0.1:8080/v1/rooms/<房间ID>/ws?token=demo-token&name=B
 
 示例的鉴权规则仅为演示：`token=demo-token` 时放行，`name` 作为控制台显示名。真实使用方可以按自己的业务校验任意 query、请求头（例如短时令牌、Cookie 之外的签名头），只返回 `allow` 与可选显示名。
 
+启用 WebRTC 时，创建房间响应还会附带 `webrtc_path` / `webrtc_url`。音视频客户端连接该地址并完成同一套实时鉴权后，即可按 [docs/protocol.md](docs/protocol.md) 第 5 节进行 SDP/ICE 信令与 RTP 轨道收发。
+
 ### 开发模式
 
 ```bash
@@ -86,6 +90,10 @@ cd web && npm install && npm run dev
 | `XR_DEFAULT_MAX_PARTICIPANTS` | `50` | 创建房间未指定人数上限时的默认值 |
 | `XR_MAX_PARTICIPANTS` | `500` | 房间人数上限的最大值 |
 | `XR_MAX_FRAME_BYTES` | `1048576` | 单帧最大字节数（1 MiB），1KB–64MB |
+| `XR_WEBRTC_ENABLED` | `true` | 是否启用自托管 WebRTC SFU |
+| `XR_WEBRTC_UDP_PORT_MIN` / `XR_WEBRTC_UDP_PORT_MAX` | `50000` / `50100` | WebRTC UDP 端口范围，1024–65535 |
+| `XR_WEBRTC_PUBLIC_IP` | 空 | 1:1 NAT/容器对外的 IP，多个用逗号分隔；用于重写 ICE 候选 |
+| `XR_WEBRTC_MAX_TRACKS_PER_PEER` | `8` | 每个 WebRTC 参与者最多发布的轨道数，1–32 |
 | `XR_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
 ## HTTP / WebSocket 接口
@@ -98,18 +106,41 @@ cd web && npm install && npm run dev
 | `GET` | `/v1/rooms` | 列出当前密钥名下的房间 |
 | `DELETE` | `/v1/rooms/{id}` | 关闭自己的房间 |
 | `WS` | `/v1/agent` | 使用方鉴权通道（每个密钥同时一个连接） |
-| `WS` | `/v1/rooms/{id}/ws` | 用户加入房间 |
+| `WS` | `/v1/rooms/{id}/ws` | 用户加入房间（WebSocket 帧通道） |
+| `WS` | `/v1/rooms/{id}/webrtc` | 用户加入房间（WebRTC 信令与媒体通道） |
 | `GET` | `/healthz` | 健康检查 |
 
 管理接口位于 `/api/admin/*`，使用 HttpOnly 会话 Cookie；完整的控制协议、鉴权消息、错误码与转发语义见 [docs/protocol.md](docs/protocol.md)。
 
 ## 转发语义
 
+### WebSocket 帧
+
 - 只接受 WebSocket 文本帧与二进制帧；消息类型保持不变，原样发给房间内除发送者以外的所有连接。
 - 中继不解析帧内容、不区分业务类型、不记录帧内容；只统计消息条数与字节数。
 - 每个用户连接有独立发送队列。队列写满表示接收端过慢，该连接会被关闭（1008），不影响其他用户。
 - 使用方程序不接收转发数据，只收到加入/离开/房间关闭等控制事件。
 - 房间与在线连接保存在内存中，服务重启后房间消失；API 密钥与管理密码持久化在 `XR_DATA_DIR/state.json`。
+
+### WebRTC 轨道
+
+- 每个 WebRTC 参与者一条独立 PeerConnection；发布轨道进入房间后，转发给其他所有参与者。
+- 服务端只读 RTP 头做路由与统计，payload、扩展与编码参数原样透传；不解码、不转码、不混流、不录制。
+- 订阅者的 PLI/FIR 会转发给发布者以请求关键帧；服务端不缓存关键帧。
+- 每个参与者最多发布 `XR_WEBRTC_MAX_TRACKS_PER_PEER` 条轨道；超限时返回信令 `error` 并忽略后续轨道。
+- 当前不提供按轨道订阅/取消订阅接口：所有已发布轨道都会挂到每个其他参与者，客户端可通过 SDP direction 或忽略 Track 来控制接收。
+- WS 与 WebRTC 参与者共享房间人数上限与在线列表；两种通道互不影响，可在同一房间并行使用。
+
+## WebRTC 数据面
+
+WebRTC 使用 [Pion](https://github.com/pion/webrtc) 在进程内实现 SFU，完全自托管：
+
+- 信令复用房间鉴权：连接 `/v1/rooms/{id}/webrtc`，通过使用方实时鉴权后升级为信令 WebSocket。
+- 客户端必须先发送 SDP offer；服务端应答后，会对房间内已有轨道及后续新增轨道发起重协商。详细的信令 JSON 与协商顺序见 [docs/protocol.md](docs/protocol.md) 第 5 节。
+- 媒体走 UDP，默认端口范围 `50000–50100`，需要放行防火墙与容器端口。反向代理只覆盖 HTTP/WS，不代理 WebRTC 的 UDP 流量。
+- 服务端只广告本机候选；在 1:1 NAT 或容器后，通过 `XR_WEBRTC_PUBLIC_IP` 填写对外可达 IP。
+- 不内置 STUN/TURN。客户端需要能直接访问服务端 UDP 端口；强制对称 NAT 或仅允许 443/TCP 的网络可能无法建立媒体连接。
+- 设置 `XR_WEBRTC_ENABLED=false` 可完全关闭媒体面，此时创建房间不再返回 `webrtc_url`，媒体加入返回 `503 webrtc_unavailable`。
 
 ## 安全说明
 
@@ -124,19 +155,23 @@ cd web && npm install && npm run dev
 ### Docker
 
 ```bash
-docker build -t xiaoyurepeater:0.1.0 .
+docker build -t xiaoyurepeater:0.2.0 .
 docker run -d --name repeater \
   -p 8080:8080 \
+  -p 50000-50100:50000-50100/udp \
   -v repeater-data:/data \
   -e XR_ADMIN_PASSWORD='<至少 8 位的管理密码>' \
-  xiaoyurepeater:0.1.0
+  -e XR_WEBRTC_PUBLIC_IP='<主机对外 IP>' \
+  xiaoyurepeater:0.2.0
 ```
 
-镜像内以非 root 用户运行，数据目录为 `/data`。控制台已嵌入二进制。
+镜像内以非 root 用户运行，数据目录为 `/data`。控制台已嵌入二进制。UDP 端口范围必须与 `XR_WEBRTC_UDP_PORT_MIN/MAX` 一致，且范围大小需覆盖预期的并发媒体连接数；不使用 WebRTC 时可移除 UDP 映射并设置 `XR_WEBRTC_ENABLED=false`。
 
 ### 反向代理
 
 Nginx/Caddy 需转发 WebSocket Upgrade 头到本服务；若代理终止 TLS，设置 `XR_TRUST_PROXY=true`，中继会依据 `X-Forwarded-Proto` 生成 `wss://` 加入地址并启用 Secure Cookie。
+
+WebRTC 媒体流量走 UDP，不经过 HTTP 反向代理；需要在主机或云安全组直接放行 `XR_WEBRTC_UDP_PORT_MIN`–`XR_WEBRTC_UDP_PORT_MAX`，并在 NAT 场景配置 `XR_WEBRTC_PUBLIC_IP`。
 
 ### 单实例约束
 
@@ -150,9 +185,9 @@ Nginx/Caddy 需转发 WebSocket Upgrade 头到本服务；若代理终止 TLS，
 ├── internal/
 │   ├── auth/               管理会话、密码、登录限速
 │   ├── config/             环境变量配置
-│   ├── hub/                房间、使用方通道、用户连接与字节转发
+│   ├── hub/                房间、使用方通道、WS 帧转发、WebRTC SFU
 │   ├── password/           PBKDF2 密码哈希
-│   ├── protocol/           使用方控制协议消息
+│   ├── protocol/           使用方控制协议与 WebRTC 信令消息
 │   ├── server/             HTTP 路由、管理 API、使用方 API、SPA 托管
 │   ├── store/              state.json 持久化
 │   └── version/            版本号（可由 ldflags 注入）

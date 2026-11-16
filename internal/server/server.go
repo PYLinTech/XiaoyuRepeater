@@ -47,16 +47,27 @@ func New(cfg config.Config, st *store.Store, logger *slog.Logger) (*Server, erro
 		log:   logger,
 		store: st,
 		auth:  authSvc,
-		hub: hub.New(hub.Config{
-			MaxRoomsPerKey:         cfg.MaxRoomsPerKey,
-			DefaultMaxParticipants: cfg.DefaultMaxParticipants,
-			MaxParticipantsCap:     cfg.MaxParticipantsCap,
-			MaxFrameBytes:          cfg.MaxFrameBytes,
-			AuthTimeout:            cfg.AuthTimeout,
-		}, logger),
-		mux:  http.NewServeMux(),
-		dist: dist,
+		mux:   http.NewServeMux(),
+		dist:  dist,
 	}
+	engine, err := hub.New(hub.Config{
+		MaxRoomsPerKey:         cfg.MaxRoomsPerKey,
+		DefaultMaxParticipants: cfg.DefaultMaxParticipants,
+		MaxParticipantsCap:     cfg.MaxParticipantsCap,
+		MaxFrameBytes:          cfg.MaxFrameBytes,
+		AuthTimeout:            cfg.AuthTimeout,
+		WebRTC: hub.WebRTCConfig{
+			Enabled:          cfg.WebRTCEnabled,
+			UDPPortMin:       cfg.WebRTCUDPPortMin,
+			UDPPortMax:       cfg.WebRTCUDPPortMax,
+			PublicIPs:        cfg.WebRTCPublicIPs,
+			MaxTracksPerPeer: cfg.WebRTCMaxTracksPerPeer,
+		},
+	}, logger)
+	if err != nil {
+		return nil, err
+	}
+	s.hub = engine
 	s.routes()
 	return s, nil
 }
@@ -89,6 +100,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/rooms", s.handleConsumerListRooms)
 	s.mux.HandleFunc("DELETE /v1/rooms/{id}", s.handleConsumerCloseRoom)
 	s.mux.HandleFunc("GET /v1/rooms/{id}/ws", s.handleUserWS)
+	s.mux.HandleFunc("GET /v1/rooms/{id}/webrtc", s.handleUserWebRTC)
 	s.mux.HandleFunc("GET /v1/agent", s.handleAgentWS)
 
 	s.mux.HandleFunc("/api/", s.handleAPINotFound)

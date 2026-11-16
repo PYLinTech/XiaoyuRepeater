@@ -1,11 +1,11 @@
 # 控制协议与转发语义
 
-协议版本：**1**。所有控制消息均为 UTF-8 JSON 文本帧；数据面帧不做任何解析。
+协议版本：**1**。所有控制消息均为 UTF-8 JSON 文本帧。WebSocket 数据面帧不做任何解析；WebRTC 数据面只读取 RTP 头做转发路由，payload 原样透传。
 
 中继分为两层：
 
 - **控制面**：API 密钥、房间生命周期、加入前鉴权、加入/离开事件。
-- **数据面**：房间内用户之间的 WebSocket 帧原样转发。中继不读取、不记录、不改写帧内容，也不把数据转发给使用方程序。
+- **数据面**：房间内用户之间的 WebSocket 帧原样转发，以及可选的自托管 WebRTC SFU 轨道转发。中继不读取、不记录、不改写业务内容，也不把用户数据转发给使用方程序。
 
 ---
 
@@ -62,15 +62,21 @@ Content-Type: application/json
     "participant_count": 0,
     "participants": [],
     "agent_online": true,
+    "rtc_peers": 0,
+    "tracks": 0,
     "messages": 0,
-    "bytes": 0
+    "bytes": 0,
+    "rtp_packets": 0,
+    "rtp_bytes": 0
   },
   "ws_path": "/v1/rooms/r_xxxxxxxxx/ws",
-  "ws_url": "ws://127.0.0.1:8080/v1/rooms/r_xxxxxxxxx/ws"
+  "ws_url": "ws://127.0.0.1:8080/v1/rooms/r_xxxxxxxxx/ws",
+  "webrtc_path": "/v1/rooms/r_xxxxxxxxx/webrtc",
+  "webrtc_url": "ws://127.0.0.1:8080/v1/rooms/r_xxxxxxxxx/webrtc"
 }
 ```
 
-`ws_url` 依据请求 Host 与 HTTPS 状态生成；若服务在反向代理后，需正确配置 `XR_TRUST_PROXY` 与转发头。
+`ws_url`、`webrtc_url` 依据请求 Host 与 HTTPS 状态生成；若服务在反向代理后，需正确配置 `XR_TRUST_PROXY` 与转发头。WebRTC 数据面关闭时（`XR_WEBRTC_ENABLED=false`），响应中不包含 `webrtc_path` 与 `webrtc_url`。
 
 单密钥房间数达到 `XR_MAX_ROOMS_PER_KEY` 时返回 `429 too_many_rooms`。
 
@@ -130,7 +136,9 @@ Authorization: Bearer <API密钥>
     "max_rooms": 100,
     "max_frame_bytes": 1048576,
     "auth_timeout_ms": 10000,
-    "max_participants_limit": 500
+    "max_participants_limit": 500,
+    "webrtc": true,
+    "max_tracks_per_peer": 8
   }
 }
 ```
@@ -147,6 +155,7 @@ Authorization: Bearer <API密钥>
   "request_id": "aq_xxxxxxxxx",
   "room_id": "r_xxxxxxxxx",
   "room_name": "演示房间",
+  "transport": "ws",
   "remote_addr": "203.0.113.10",
   "query": {
     "token": ["用户带来的值"],
@@ -162,6 +171,7 @@ Authorization: Bearer <API密钥>
 
 转发给使用方的用户请求信息：
 
+- `transport` 为 `ws`（WebSocket 帧通道）或 `webrtc`（WebRTC 媒体通道）；使用方可据此采用不同的鉴权策略。
 - 保留用户 WS 握手请求的 query 与请求头，供使用方自行鉴权。
 - **始终剔除 `Cookie`** 与 WebSocket 握手头（`Sec-WebSocket-*`、`Connection`、`Upgrade` 等），避免控制台会话泄漏。
 - `Authorization` 会原样转发，使用方可用它承载自己的用户令牌。
@@ -213,6 +223,7 @@ Authorization: Bearer <API密钥>
   "room_name": "演示房间",
   "conn_id": "c_xxxxxx",
   "subject": "Alice",
+  "transport": "ws",
   "remote_addr": "203.0.113.10",
   "joined_at": "2026-11-16T10:00:06Z"
 }
@@ -227,6 +238,7 @@ Authorization: Bearer <API密钥>
   "room_name": "演示房间",
   "conn_id": "c_xxxxxx",
   "subject": "Alice",
+  "transport": "ws",
   "reason": "client_closed",
   "left_at": "2026-11-16T10:03:00Z"
 }
@@ -294,6 +306,7 @@ Upgrade: websocket
 ```http
 X-Repeater-Room: r_xxxxxxxxx
 X-Repeater-Subject: <URL 编码的显示名>
+X-Repeater-Transport: ws
 ```
 
 随后连接进入房间。用户帧只在房间内转发，不经过使用方通道。
@@ -308,9 +321,152 @@ X-Repeater-Subject: <URL 编码的显示名>
 | `4000` | 房间被关闭；reason 见 `room_closed` |
 | `4004` | 升级后加入失败（房间关闭/已满） |
 
+WebRTC 信令连接使用同一套关闭码；此外，服务端在信令写队列溢出时以 `1008` 关闭，在信令 offer 超时或 SDP/ICE 失败时关闭 PeerConnection 并断开信令连接。
+
 ---
 
-## 5. 数据面语义
+## 5. WebRTC 媒体通道
+
+服务端内置可选的 WebRTC SFU（Pion），不依赖外部信令、STUN、TURN 或媒体服务。每个通过鉴权的用户建立一条独立 PeerConnection，发布的 RTP 轨道进入房间，由服务端转发给房间内其他参与者的 PeerConnection。
+
+由 `XR_WEBRTC_ENABLED` 控制（默认开启）。关闭时加入地址直接返回 `503 webrtc_unavailable`（不触发使用方鉴权），创建房间响应不包含 `webrtc_path` / `webrtc_url`。
+
+### 5.1 加入与鉴权
+
+```http
+GET /v1/rooms/{id}/webrtc
+Upgrade: websocket
+```
+
+用户在 query 或请求头中携带任意鉴权信息，规则与 WebSocket 用户完全一致：先做房间存在性、容量、使用方在线检查，再向使用方发送 `auth_request`，其中 `transport` 为 `webrtc`。拒绝、超时、房间已满等错误与第 4.1 节相同。
+
+鉴权通过后完成 WebSocket 升级，响应头：
+
+```http
+X-Repeater-Room: r_xxxxxxxxx
+X-Repeater-Subject: <URL 编码的显示名>
+X-Repeater-Transport: webrtc
+```
+
+随后该 WebSocket 只承载 WebRTC 信令，不转发任何业务字节。WS 用户与 WebRTC 参与者共享同一个房间人数上限和参与者列表。
+
+### 5.2 信令格式
+
+信令为 UTF-8 JSON 文本帧，双向使用同一结构：
+
+```json
+{
+  "type": "offer",
+  "sdp": "v=0\r\n..."
+}
+```
+
+```json
+{
+  "type": "answer",
+  "sdp": "v=0\r\n..."
+}
+```
+
+```json
+{
+  "type": "ice",
+  "candidate": {
+    "candidate": "candidate:1 1 udp 2130706431 203.0.113.10 50000 typ host",
+    "sdp_mid": "0",
+    "sdp_mline_index": 0,
+    "username_fragment": "xxxx"
+  }
+}
+```
+
+```json
+{
+  "type": "track_added",
+  "track": {
+    "id": "t_xxxxxxxx",
+    "kind": "audio",
+    "stream_id": "microphone",
+    "codec": "audio/opus",
+    "publisher_id": "p_xxxxxxxx",
+    "subject": "Alice"
+  }
+}
+```
+
+```json
+{
+  "type": "track_removed",
+  "track": {
+    "id": "t_xxxxxxxx",
+    "kind": "audio",
+    "stream_id": "microphone",
+    "codec": "audio/opus",
+    "publisher_id": "p_xxxxxxxx",
+    "subject": "Alice"
+  }
+}
+```
+
+```json
+{
+  "type": "bye"
+}
+```
+
+```json
+{
+  "type": "error",
+  "error": "发布轨道数量超过上限"
+}
+```
+
+| `type` | 方向 | 说明 |
+| --- | --- | --- |
+| `offer` | 双向 | SDP offer；客户端必须首先发送自己的首个 offer |
+| `answer` | 双向 | 对收到的 offer 的应答 |
+| `ice` | 双向 | Trickle ICE 候选；可在远端描述设置前提前到达，服务端会暂存 |
+| `track_added` | 服务端 → 用户 | 服务端已把某条房间轨道挂到该连接，随后会发起重协商 |
+| `track_removed` | 服务端 → 用户 | 轨道已停止（发布者离开或取消发布），随后会发起重协商 |
+| `bye` | 用户 → 服务端 | 主动优雅离开；服务端关闭 PeerConnection 与信令连接 |
+| `error` | 服务端 → 用户 | 信令错误或轨道数量超限；是否断开取决于错误类型 |
+
+`kind`、`codec`、`stream_id`、`rid` 均为发布端透传的元数据，中继不据此改变媒体内容。
+
+### 5.3 协商流程
+
+1. 客户端创建 PeerConnection，按需添加发送轨道（`addTrack`）或接收方向（`recvonly` transceiver）。
+2. 客户端发送首个 `offer`；服务端回 `answer`。
+3. 服务端在首个 offer/answer 完成后，把房间内已有轨道挂到该连接，并发送 `track_added`，随后主动发送 `offer`；客户端回 `answer`。
+4. 后续任何一方新增轨道都会触发服务端重协商：服务端发送 `offer`，客户端回 `answer`。
+5. ICE 候选可随时双向发送。服务端 offer 在 15 秒内未收到 answer 会关闭该连接。
+
+注意事项：
+
+- 服务端不会先于客户端发起首个 offer；客户端必须主动发送 offer，否则无法建立媒体连接。
+- 若客户端在服务端 offer 尚未应答时发送新的 offer，服务端会回滚自己的本地 offer、处理客户端 offer，并在信令稳定后重新发起服务端 offer。
+- 房间内所有已发布轨道都会转发给每个其他参与者，当前不提供按轨道订阅/取消订阅的接口；客户端可通过 SDP 的 direction 自行忽略不接收的轨道，或直接不读取该 Track。
+- 每个参与者最多发布 `XR_WEBRTC_MAX_TRACKS_PER_PEER` 条轨道（默认 8，范围 1–32），超限时服务端发送 `error` 并忽略后续轨道。
+
+### 5.4 媒体转发语义
+
+- 每条发布轨道对应一个房间级轨道；每个订阅者获得独立的 `TrackLocalStaticRTP`，服务端按 RTP 包逐包复制。
+- 只解析 RTP 头用于路由与统计，payload、扩展头内容、编码参数均原样透传；不解码、不转码、不混流、不录制、不落盘。
+- 服务端不实现业务层订阅、发言权、静音或内容规则；这些由使用方与用户自行约定。
+- 订阅者发送的 PLI/FIR 会转发给发布者以请求关键帧，服务端不做关键帧缓存。
+- 未知轨道/未知信令类型会被忽略；非法 JSON 或无效 SDP 会返回 `error`。
+- 媒体数据只在 PeerConnection 的 UDP 通道传输，不经过信令 WebSocket，也不经过使用方通道。
+
+### 5.5 网络与部署
+
+- 服务端默认在 `50000–50100/udp` 范围内为每个 PeerConnection 分配端口，需在防火墙与容器映射中放行。端口范围决定可并发的媒体连接数，房间规模较大时应同步扩大范围。
+- 服务端只使用本机候选地址；当服务位于 1:1 NAT 或容器后，用 `XR_WEBRTC_PUBLIC_IP` 填写对外可达 IP，服务端会重写候选地址。多个 IP 用逗号分隔。
+- 不内置 STUN/TURN。客户端需能直接访问服务端的 UDP 端口；强制对称 NAT、仅允许 443/TCP 的网络可能无法建立媒体连接。
+- 反向代理只代理 HTTP 与 WebSocket；WebRTC 的 UDP 流量不经过反向代理，必须由主机直接暴露端口。
+
+---
+
+## 6. 数据面语义
 
 鉴权通过并完成 WebSocket 升级后：
 
@@ -323,9 +479,11 @@ X-Repeater-Subject: <URL 编码的显示名>
 - 中继按「每次转发」统计消息数与字节数，不按接收人数重复计数；统计数据仅用于控制台展示。
 - 服务端不持久化任何转发内容；房间与连接状态仅存在于内存。
 
+WebRTC 数据面见第 5.4 节：RTP 包按轨道逐包转发，统计字段为 `rtp_packets` / `rtp_bytes`，与 WebSocket 的 `messages` / `bytes` 分开累计。
+
 ---
 
-## 6. 管理接口
+## 7. 管理接口
 
 管理接口位于 `/api/admin/*`，使用 `xr_admin` 会话 Cookie（`HttpOnly`、`SameSite=Strict`，HTTPS 下 `Secure`）。除 `session`、首次 `setup`、`login` 外均需登录；写操作校验同源 `Origin`。
 
@@ -346,8 +504,10 @@ X-Repeater-Subject: <URL 编码的显示名>
 
 `GET /healthz` 无需鉴权，用于健康检查。
 
+`overview`、房间列表与房间详情的统计包含 WS 与 WebRTC 两部分：`rtc_peers`（WebRTC 参与人数）、`tracks`（房间内已发布轨道数）、`rtp_packets` / `rtp_bytes`（RTP 转发量）。参与者条目带 `transport`（`ws` / `webrtc`），WebRTC 参与者另有 `tracks`（本人发布的轨道数）。
+
 ---
 
-## 7. 使用方示例
+## 8. 使用方示例
 
 完整可运行示例见 [`examples/consumer`](../examples/consumer/main.go)：创建房间、建立鉴权通道、按演示令牌放行、处理事件、断线重连与退出时关闭房间。示例仅演示控制面流程；用户之间的数据由用户自行收发，中继原样转发。

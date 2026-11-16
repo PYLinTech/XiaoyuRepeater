@@ -16,10 +16,16 @@ type Room struct {
 
 	mu           sync.RWMutex
 	participants map[string]*Participant
+	peers        map[string]*RTCPeer
 	closed       bool
 
-	messages atomic.Int64
-	bytes    atomic.Int64
+	rtcMu     sync.Mutex
+	published map[string]*publishedTrack
+
+	messages   atomic.Int64
+	bytes      atomic.Int64
+	rtpPackets atomic.Int64
+	rtpBytes   atomic.Int64
 }
 
 func (r *Room) addParticipant(p *Participant) *Error {
@@ -28,10 +34,23 @@ func (r *Room) addParticipant(p *Participant) *Error {
 	if r.closed {
 		return ErrRoomClosed
 	}
-	if len(r.participants) >= r.MaxParticipants {
+	if len(r.participants)+len(r.peers) >= r.MaxParticipants {
 		return ErrRoomFull
 	}
 	r.participants[p.ID] = p
+	return nil
+}
+
+func (r *Room) addPeer(p *RTCPeer) *Error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrRoomClosed
+	}
+	if len(r.participants)+len(r.peers) >= r.MaxParticipants {
+		return ErrRoomFull
+	}
+	r.peers[p.ID] = p
 	return nil
 }
 
@@ -45,16 +64,36 @@ func (r *Room) removeParticipant(id string) bool {
 	return true
 }
 
+func (r *Room) removePeer(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.peers[id]; !ok {
+		return false
+	}
+	delete(r.peers, id)
+	return true
+}
+
 func (r *Room) participantCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.participants)
+	return len(r.participants) + len(r.peers)
+}
+
+func (r *Room) peersSnapshot() []*RTCPeer {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*RTCPeer, 0, len(r.peers))
+	for _, p := range r.peers {
+		out = append(out, p)
+	}
+	return out
 }
 
 func (r *Room) isFull() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.participants) >= r.MaxParticipants
+	return len(r.participants)+len(r.peers) >= r.MaxParticipants
 }
 
 func (r *Room) isClosed() bool {
@@ -63,35 +102,92 @@ func (r *Room) isClosed() bool {
 	return r.closed
 }
 
-// closeAndDetach marks the room closed, empties the participant map and
-// returns the connections that still need to be closed.
-func (r *Room) closeAndDetach() []*Participant {
+// closeAndDetach marks the room closed, empties the member maps and returns
+// the connections that still need to be closed.
+func (r *Room) closeAndDetach() ([]*Participant, []*RTCPeer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return nil
+		return nil, nil
 	}
 	r.closed = true
-	out := make([]*Participant, 0, len(r.participants))
+	participants := make([]*Participant, 0, len(r.participants))
 	for _, p := range r.participants {
-		out = append(out, p)
+		participants = append(participants, p)
+	}
+	peers := make([]*RTCPeer, 0, len(r.peers))
+	for _, p := range r.peers {
+		peers = append(peers, p)
 	}
 	r.participants = make(map[string]*Participant)
+	r.peers = make(map[string]*RTCPeer)
+	return participants, peers
+}
+
+func (r *Room) publish(track *publishedTrack) bool {
+	if r.isClosed() {
+		return false
+	}
+	r.rtcMu.Lock()
+	defer r.rtcMu.Unlock()
+	if r.published == nil {
+		r.published = make(map[string]*publishedTrack)
+	}
+	r.published[track.key] = track
+	return true
+}
+
+func (r *Room) unpublish(key string) *publishedTrack {
+	r.rtcMu.Lock()
+	defer r.rtcMu.Unlock()
+	track := r.published[key]
+	if track != nil {
+		delete(r.published, key)
+	}
+	return track
+}
+
+func (r *Room) publishedSnapshot() []*publishedTrack {
+	r.rtcMu.Lock()
+	defer r.rtcMu.Unlock()
+	out := make([]*publishedTrack, 0, len(r.published))
+	for _, track := range r.published {
+		out = append(out, track)
+	}
 	return out
+}
+
+func (r *Room) publishedCount() int {
+	r.rtcMu.Lock()
+	defer r.rtcMu.Unlock()
+	return len(r.published)
 }
 
 func (r *Room) snapshot(agentOnline bool) RoomInfo {
 	r.mu.RLock()
-	participants := make([]ParticipantInfo, 0, len(r.participants))
+	participants := make([]ParticipantInfo, 0, len(r.participants)+len(r.peers))
 	for _, p := range r.participants {
 		participants = append(participants, ParticipantInfo{
 			ID:         p.ID,
 			Subject:    p.Subject,
+			Transport:  "ws",
 			RemoteAddr: p.RemoteAddr,
 			UserAgent:  p.UserAgent,
 			JoinedAt:   p.JoinedAt,
 		})
 	}
+	for _, p := range r.peers {
+		participants = append(participants, ParticipantInfo{
+			ID:         p.ID,
+			Subject:    p.Subject,
+			Transport:  "webrtc",
+			Tracks:     p.publishedCount(),
+			RemoteAddr: p.RemoteAddr,
+			UserAgent:  p.UserAgent,
+			JoinedAt:   p.JoinedAt,
+		})
+	}
+	peerCount := len(r.peers)
 	r.mu.RUnlock()
 	sortParticipants(participants)
 
@@ -105,14 +201,23 @@ func (r *Room) snapshot(agentOnline bool) RoomInfo {
 		ParticipantCount: len(participants),
 		Participants:     participants,
 		AgentOnline:      agentOnline,
+		RTCPeers:         peerCount,
+		Tracks:           r.publishedCount(),
 		Messages:         r.messages.Load(),
 		Bytes:            r.bytes.Load(),
+		RTPPackets:       r.rtpPackets.Load(),
+		RTPBytes:         r.rtpBytes.Load(),
 	}
 }
 
 func (r *Room) recordTraffic(n int64) {
 	r.messages.Add(1)
 	r.bytes.Add(n)
+}
+
+func (r *Room) recordRTP(n int64) {
+	r.rtpPackets.Add(1)
+	r.rtpBytes.Add(n)
 }
 
 func sortParticipants(items []ParticipantInfo) {
@@ -126,6 +231,8 @@ func sortParticipants(items []ParticipantInfo) {
 type ParticipantInfo struct {
 	ID         string    `json:"id"`
 	Subject    string    `json:"subject"`
+	Transport  string    `json:"transport"`
+	Tracks     int       `json:"tracks,omitempty"`
 	RemoteAddr string    `json:"remote_addr"`
 	UserAgent  string    `json:"user_agent"`
 	JoinedAt   time.Time `json:"joined_at"`
@@ -141,6 +248,10 @@ type RoomInfo struct {
 	ParticipantCount int               `json:"participant_count"`
 	Participants     []ParticipantInfo `json:"participants"`
 	AgentOnline      bool              `json:"agent_online"`
+	RTCPeers         int               `json:"rtc_peers"`
+	Tracks           int               `json:"tracks"`
 	Messages         int64             `json:"messages"`
 	Bytes            int64             `json:"bytes"`
+	RTPPackets       int64             `json:"rtp_packets"`
+	RTPBytes         int64             `json:"rtp_bytes"`
 }

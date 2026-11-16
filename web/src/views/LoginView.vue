@@ -138,7 +138,7 @@ async function submit() {
             <span class="dot online" />
             实时中继
           </span>
-          <span class="foot-version">v{{ authState.version || '0.1.0' }}</span>
+          <span class="foot-version">v{{ authState.version || '0.2.0' }}</span>
         </div>
       </div>
       <p class="login-note">会议分发 · 远程协助 · 实时双向转发</p>

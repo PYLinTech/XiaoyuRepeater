@@ -46,8 +46,9 @@ type createdRoom struct {
 		Name            string `json:"name"`
 		MaxParticipants int    `json:"max_participants"`
 	} `json:"room"`
-	WSPath string `json:"ws_path"`
-	WSURL  string `json:"ws_url"`
+	WSPath    string `json:"ws_path"`
+	WSURL     string `json:"ws_url"`
+	WebRTCURL string `json:"webrtc_url"`
 }
 
 func main() {
@@ -94,6 +95,15 @@ func run(ctx context.Context, opts options) error {
 		return fmt.Errorf("生成加入地址失败：%w", err)
 	}
 	log.Printf("用户加入地址（示例）：%s", joinURL)
+	if room.WebRTCURL != "" {
+		rtcURL, err := withQuery(room.WebRTCURL, url.Values{
+			"token": {opts.demoToken},
+			"name":  {"Alice"},
+		})
+		if err == nil {
+			log.Printf("WebRTC 信令地址（示例）：%s", rtcURL)
+		}
+	}
 	log.Printf("鉴权规则：token 等于演示令牌时放行，name 作为显示名。")
 	log.Printf("数据面由房间内用户直接收发 WS 文本/二进制帧，中继原样转发，不解析内容。")
 
@@ -282,9 +292,11 @@ func runAgent(ctx context.Context, endpoint string, opts options, room createdRo
 			}
 			resp := decideAuth(req, opts.demoToken)
 			if resp.Allow != nil && *resp.Allow {
-				log.Printf("放行用户「%s」（%s，房间「%s」）", resp.Subject, req.RemoteAddr, req.RoomName)
+				log.Printf("放行用户「%s」（%s，%s，房间「%s」）",
+					resp.Subject, transportLabel(req.Transport), req.RemoteAddr, req.RoomName)
 			} else {
-				log.Printf("拒绝用户（%s，房间「%s」）：%s", req.RemoteAddr, req.RoomName, resp.Reason)
+				log.Printf("拒绝用户（%s，房间「%s」）：%s",
+					transportLabel(req.Transport), req.RoomName, resp.Reason)
 			}
 			if err := writeJSON(resp); err != nil {
 				return fmt.Errorf("发送鉴权结果失败：%w", err)
@@ -292,12 +304,14 @@ func runAgent(ctx context.Context, endpoint string, opts options, room createdRo
 		case protocol.TypeUserJoined:
 			var event protocol.UserJoined
 			if json.Unmarshal(data, &event) == nil {
-				log.Printf("用户「%s」加入了房间「%s」", event.Subject, event.RoomName)
+				log.Printf("用户「%s」通过 %s 加入了房间「%s」",
+					event.Subject, transportLabel(event.Transport), event.RoomName)
 			}
 		case protocol.TypeUserLeft:
 			var event protocol.UserLeft
 			if json.Unmarshal(data, &event) == nil {
-				log.Printf("用户「%s」离开了房间「%s」（%s）", event.Subject, event.RoomName, event.Reason)
+				log.Printf("用户「%s」离开了房间「%s」（%s，%s）",
+					event.Subject, event.RoomName, transportLabel(event.Transport), event.Reason)
 			}
 		case protocol.TypeRoomClosed:
 			var event protocol.RoomClosed
@@ -376,6 +390,13 @@ func firstValue(values []string) string {
 		return ""
 	}
 	return strings.TrimSpace(values[0])
+}
+
+func transportLabel(transport string) string {
+	if transport == protocol.TransportWebRTC {
+		return "WebRTC"
+	}
+	return "WS"
 }
 
 func envOr(key, fallback string) string {

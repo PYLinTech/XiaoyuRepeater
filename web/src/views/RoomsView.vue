@@ -138,7 +138,7 @@ function closeDrawer() {
               <th>房间</th>
               <th>使用方</th>
               <th class="num">在线用户</th>
-              <th class="num">累计消息</th>
+              <th class="num">WS 消息</th>
               <th>创建时间</th>
               <th>状态</th>
               <th class="action-col" />
@@ -153,8 +153,16 @@ function closeDrawer() {
               <td><span class="cell-text" :title="room.key_name">{{ room.key_name }}</span></td>
               <td class="num">
                 {{ room.participant_count }}<span class="cell-muted"> / {{ room.max_participants }}</span>
+                <div v-if="room.rtc_peers" class="cell-sub">
+                  WebRTC {{ room.rtc_peers }} · 轨道 {{ room.tracks }}
+                </div>
               </td>
-              <td class="num">{{ formatNumber(room.messages) }}</td>
+              <td class="num">
+                {{ formatNumber(room.messages) }}
+                <div v-if="room.rtp_packets" class="cell-sub">
+                  RTP {{ formatNumber(room.rtp_packets) }} 包
+                </div>
+              </td>
               <td class="cell-muted nowrap">{{ formatTime(room.created_at) }}</td>
               <td>
                 <span class="status" :class="room.agent_online ? 'ok' : 'warn'">
@@ -306,6 +314,10 @@ function closeDrawer() {
 
 .rooms-table {
   min-width: 760px;
+}
+
+.cell-sub {
+  font-family: inherit;
 }
 
 .nowrap {

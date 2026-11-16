@@ -13,6 +13,19 @@ const (
 	TypeRoomClosed   = "room_closed"
 	TypePing         = "ping"
 	TypePong         = "pong"
+
+	TypeOffer        = "offer"
+	TypeAnswer       = "answer"
+	TypeICE          = "ice"
+	TypeBye          = "bye"
+	TypeError        = "error"
+	TypeTrackAdded   = "track_added"
+	TypeTrackRemoved = "track_removed"
+)
+
+const (
+	TransportWebSocket = "ws"
+	TransportWebRTC    = "webrtc"
 )
 
 type RoomRef struct {
@@ -38,6 +51,8 @@ type Limits struct {
 	MaxFrameBytes        int64 `json:"max_frame_bytes"`
 	AuthTimeoutMillis    int   `json:"auth_timeout_ms"`
 	MaxParticipantsLimit int   `json:"max_participants_limit"`
+	WebRTC               bool  `json:"webrtc"`
+	MaxTracksPerPeer     int   `json:"max_tracks_per_peer"`
 }
 
 type AuthRequest struct {
@@ -45,6 +60,7 @@ type AuthRequest struct {
 	RequestID   string              `json:"request_id"`
 	RoomID      string              `json:"room_id"`
 	RoomName    string              `json:"room_name"`
+	Transport   string              `json:"transport"`
 	RemoteAddr  string              `json:"remote_addr"`
 	Query       map[string][]string `json:"query"`
 	Headers     map[string][]string `json:"headers"`
@@ -66,19 +82,21 @@ type UserJoined struct {
 	RoomID     string    `json:"room_id"`
 	RoomName   string    `json:"room_name"`
 	ConnID     string    `json:"conn_id"`
+	Transport  string    `json:"transport"`
 	Subject    string    `json:"subject"`
 	RemoteAddr string    `json:"remote_addr"`
 	JoinedAt   time.Time `json:"joined_at"`
 }
 
 type UserLeft struct {
-	Type     string    `json:"type"`
-	RoomID   string    `json:"room_id"`
-	RoomName string    `json:"room_name"`
-	ConnID   string    `json:"conn_id"`
-	Subject  string    `json:"subject"`
-	Reason   string    `json:"reason"`
-	LeftAt   time.Time `json:"left_at"`
+	Type      string    `json:"type"`
+	RoomID    string    `json:"room_id"`
+	RoomName  string    `json:"room_name"`
+	ConnID    string    `json:"conn_id"`
+	Transport string    `json:"transport"`
+	Subject   string    `json:"subject"`
+	Reason    string    `json:"reason"`
+	LeftAt    time.Time `json:"left_at"`
 }
 
 type RoomClosed struct {
@@ -97,4 +115,34 @@ type Ping struct {
 type Pong struct {
 	Type string    `json:"type"`
 	Time time.Time `json:"time"`
+}
+
+// RTCSignal is the JSON envelope used only on the room signaling channel.
+// SDP and ICE candidates are opaque to the relay; RTP payloads never pass
+// through this channel.
+type RTCSignal struct {
+	Type      string        `json:"type"`
+	SDP       string        `json:"sdp,omitempty"`
+	Candidate *ICECandidate `json:"candidate,omitempty"`
+	Track     *RTCTrack     `json:"track,omitempty"`
+	Error     string        `json:"error,omitempty"`
+}
+
+type ICECandidate struct {
+	Candidate        string  `json:"candidate"`
+	SDPMid           *string `json:"sdp_mid,omitempty"`
+	SDPMLineIndex    *uint16 `json:"sdp_mline_index,omitempty"`
+	UsernameFragment *string `json:"username_fragment,omitempty"`
+}
+
+// RTCTrack describes a published track without interpreting its payload.
+// Codec and kind are passthrough metadata needed for SDP negotiation.
+type RTCTrack struct {
+	ID          string `json:"id"`
+	Kind        string `json:"kind"`
+	StreamID    string `json:"stream_id"`
+	Codec       string `json:"codec"`
+	RID         string `json:"rid,omitempty"`
+	PublisherID string `json:"publisher_id"`
+	Subject     string `json:"subject,omitempty"`
 }

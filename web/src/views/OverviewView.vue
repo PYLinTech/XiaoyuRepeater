@@ -28,7 +28,17 @@ const rooms = computed<RoomInfo[]>(() => data.value?.rooms.slice(0, 6) ?? [])
 const agents = computed(() => data.value?.agents ?? [])
 const events = computed(() => data.value?.events.slice(0, 10) ?? [])
 
-const counters = computed(() => {
+interface Counter {
+  key: string
+  icon: string
+  label: string
+  value: string
+  unit?: string
+  foot: string
+  hint?: string
+}
+
+const counters = computed<Counter[]>(() => {
   const s = stats.value
   return [
     {
@@ -43,7 +53,7 @@ const counters = computed(() => {
       icon: 'users',
       label: '在线用户',
       value: formatNumber(s?.participants ?? 0),
-      foot: `累计加入 ${formatNumber(s?.joins_total ?? 0)} 人次`,
+      foot: `WebRTC ${formatNumber(s?.rtc_peers ?? 0)} 人 · 累计加入 ${formatNumber(s?.joins_total ?? 0)} 人次`,
     },
     {
       key: 'agents',
@@ -55,10 +65,11 @@ const counters = computed(() => {
     {
       key: 'traffic',
       icon: 'activity',
-      label: '累计转发',
+      label: 'WS 消息',
       value: formatNumber(s?.messages_relayed ?? 0),
       unit: '条',
-      foot: `${formatBytes(s?.bytes_relayed ?? 0)} · 鉴权 ${formatNumber(s?.auth_requests ?? 0)} 次`,
+      foot: `${formatBytes(s?.bytes_relayed ?? 0)} · RTP ${formatNumber(s?.rtp_packets ?? 0)} 包`,
+      hint: `RTP 流量 ${formatBytes(s?.rtp_bytes ?? 0)}`,
     },
   ]
 })
@@ -116,7 +127,7 @@ function agentInitials(name: string) {
         <div class="stat-value">
           {{ item.value }}<span v-if="item.unit" class="stat-unit">{{ item.unit }}</span>
         </div>
-        <div class="stat-foot">{{ item.foot }}</div>
+        <div class="stat-foot" :title="item.hint || item.foot">{{ item.foot }}</div>
       </div>
     </div>
 
@@ -204,7 +215,12 @@ function agentInitials(name: string) {
                 <div class="cell-sub mono">{{ room.id }}</div>
               </td>
               <td><span class="cell-text">{{ room.key_name }}</span></td>
-              <td class="num">{{ room.participant_count }}</td>
+              <td class="num">
+                {{ room.participant_count }}
+                <div v-if="room.rtc_peers" class="cell-sub">
+                  WebRTC {{ room.rtc_peers }} · 轨道 {{ room.tracks }}
+                </div>
+              </td>
               <td>
                 <span class="status" :class="room.agent_online ? 'ok' : 'warn'">
                   <span class="status-dot" />
@@ -514,6 +530,10 @@ function agentInitials(name: string) {
 
 .room-panel {
   margin-top: 14px;
+}
+
+.cell-sub {
+  font-family: inherit;
 }
 
 .skeleton-rows {

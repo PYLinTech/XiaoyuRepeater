@@ -135,6 +135,14 @@ function avatarText(subject: string) {
                     <dt>累计流量</dt>
                     <dd>{{ formatBytes(room.bytes) }}</dd>
                   </div>
+                  <div class="info-row">
+                    <dt>实时媒体</dt>
+                    <dd>{{ room.rtc_peers }} 个连接 · {{ room.tracks }} 条轨道</dd>
+                  </div>
+                  <div class="info-row">
+                    <dt>媒体流量</dt>
+                    <dd>{{ formatNumber(room.rtp_packets) }} 包 · {{ formatBytes(room.rtp_bytes) }}</dd>
+                  </div>
                 </dl>
               </section>
 
@@ -146,8 +154,18 @@ function avatarText(subject: string) {
                     <div class="person-main">
                       <div class="person-line">
                         <span class="person-name" :title="person.subject">{{ person.subject }}</span>
+                        <span
+                          class="transport-badge"
+                          :class="person.transport"
+                          :title="person.transport === 'webrtc' ? 'WebRTC 实时媒体' : 'WebSocket 消息'"
+                        >
+                          {{ person.transport === 'webrtc' ? 'WebRTC' : 'WS' }}
+                        </span>
                       </div>
                       <div class="person-meta" :title="person.remote_addr + ' · ' + person.user_agent">
+                        <template v-if="person.transport === 'webrtc'">
+                          {{ person.tracks ?? 0 }} 条轨道 ·
+                        </template>
                         加入于 {{ formatRelative(person.joined_at) }} · {{ person.remote_addr || '未知地址' }}
                       </div>
                     </div>
@@ -412,12 +430,32 @@ function avatarText(subject: string) {
 }
 
 .person-name {
+  flex: 0 1 auto;
   min-width: 0;
   font-size: 12.5px;
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.transport-badge {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  background: #242424;
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  line-height: 1.45;
+  color: var(--text-3);
+}
+
+.transport-badge.webrtc {
+  border-color: rgba(73, 217, 167, 0.28);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .person-meta {

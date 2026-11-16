@@ -2,9 +2,13 @@ export interface StatsSnapshot {
   agents_online: number
   active_rooms: number
   participants: number
+  rtc_peers: number
+  rtc_tracks: number
   closed: boolean
   messages_relayed: number
   bytes_relayed: number
+  rtp_packets: number
+  rtp_bytes: number
   joins_total: number
   rooms_created: number
   auth_requests: number
@@ -14,6 +18,8 @@ export interface StatsSnapshot {
 export interface ParticipantInfo {
   id: string
   subject: string
+  transport: 'ws' | 'webrtc'
+  tracks?: number
   remote_addr: string
   user_agent: string
   joined_at: string
@@ -29,8 +35,12 @@ export interface RoomInfo {
   participant_count: number
   participants: ParticipantInfo[]
   agent_online: boolean
+  rtc_peers: number
+  tracks: number
   messages: number
   bytes: number
+  rtp_packets: number
+  rtp_bytes: number
 }
 
 export interface AgentInfo {

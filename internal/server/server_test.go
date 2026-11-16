@@ -210,6 +210,7 @@ func newAgentHarness(t *testing.T, tsURL, secret string, policy func(token strin
 	if hello.Type != protocol.TypeHello {
 		t.Fatalf("hello type = %q", hello.Type)
 	}
+	_ = ws.SetReadDeadline(time.Time{})
 	h := &agentHarness{
 		ws:       ws,
 		events:   make(chan map[string]any, 256),

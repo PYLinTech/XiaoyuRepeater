@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 
 	"xiaoyurepeater/internal/protocol"
 )
@@ -23,12 +24,22 @@ type Config struct {
 	MaxParticipantsCap     int
 	MaxFrameBytes          int64
 	AuthTimeout            time.Duration
+	WebRTC                 WebRTCConfig
+}
+
+type WebRTCConfig struct {
+	Enabled          bool
+	UDPPortMin       int
+	UDPPortMax       int
+	PublicIPs        []string
+	MaxTracksPerPeer int
 }
 
 type Hub struct {
-	cfg   Config
-	log   *slog.Logger
-	start time.Time
+	cfg    Config
+	log    *slog.Logger
+	start  time.Time
+	rtcAPI *webrtc.API
 
 	mu     sync.RWMutex
 	rooms  map[string]*Room
@@ -39,14 +50,16 @@ type Hub struct {
 
 	messagesRelayed atomic.Int64
 	bytesRelayed    atomic.Int64
+	rtpPackets      atomic.Int64
+	rtpBytes        atomic.Int64
 	joinsTotal      atomic.Int64
 	roomsCreated    atomic.Int64
 	authRequests    atomic.Int64
 	authDenied      atomic.Int64
 }
 
-func New(cfg Config, log *slog.Logger) *Hub {
-	return &Hub{
+func New(cfg Config, log *slog.Logger) (*Hub, error) {
+	h := &Hub{
 		cfg:    cfg,
 		log:    log,
 		start:  time.Now().UTC(),
@@ -54,6 +67,14 @@ func New(cfg Config, log *slog.Logger) *Hub {
 		agents: make(map[string]*Agent),
 		events: newEventLog(100),
 	}
+	if cfg.WebRTC.Enabled {
+		api, err := newWebRTCAPI(cfg.WebRTC)
+		if err != nil {
+			return nil, err
+		}
+		h.rtcAPI = api
+	}
+	return h, nil
 }
 
 func (h *Hub) StartedAt() time.Time { return h.start }
@@ -95,6 +116,8 @@ func (h *Hub) CreateRoom(keyID, keyName, name string, maxParticipants int) (Room
 		MaxParticipants: maxParticipants,
 		CreatedAt:       time.Now().UTC(),
 		participants:    make(map[string]*Participant),
+		peers:           make(map[string]*RTCPeer),
+		published:       make(map[string]*publishedTrack),
 	}
 	h.rooms[id] = room
 	online := h.agents[keyID] != nil
@@ -210,8 +233,11 @@ func (h *Hub) DisconnectAgent(keyID, reason string) {
 }
 
 func (h *Hub) closeRoom(room *Room, reason string, notifyAgent bool) {
-	participants := room.closeAndDetach()
+	participants, peers := room.closeAndDetach()
 	for _, p := range participants {
+		p.closeWith(4000, reason)
+	}
+	for _, p := range peers {
 		p.closeWith(4000, reason)
 	}
 	if notifyAgent {
@@ -226,7 +252,7 @@ func (h *Hub) closeRoom(room *Room, reason string, notifyAgent bool) {
 	h.events.add("room_closed", eventRoomClosed(room.Name, reason), room.ID, "")
 }
 
-func (h *Hub) AuthorizeJoin(ctx context.Context, roomID, remoteAddr string, query, headers map[string][]string) (*Room, Decision, *Error) {
+func (h *Hub) AuthorizeJoin(ctx context.Context, roomID, transport, remoteAddr string, query, headers map[string][]string) (*Room, Decision, *Error) {
 	h.mu.RLock()
 	room := h.rooms[roomID]
 	var agent *Agent
@@ -258,6 +284,7 @@ func (h *Hub) AuthorizeJoin(ctx context.Context, roomID, remoteAddr string, quer
 		RequestID:   requestID,
 		RoomID:      room.ID,
 		RoomName:    room.Name,
+		Transport:   transport,
 		RemoteAddr:  remoteAddr,
 		Query:       query,
 		Headers:     headers,
@@ -340,6 +367,7 @@ func (h *Hub) ServeParticipant(w http.ResponseWriter, r *http.Request, room *Roo
 		RoomID:     room.ID,
 		RoomName:   room.Name,
 		ConnID:     p.ID,
+		Transport:  protocol.TransportWebSocket,
 		Subject:    p.Subject,
 		RemoteAddr: p.RemoteAddr,
 		JoinedAt:   p.JoinedAt,
@@ -361,13 +389,14 @@ func (h *Hub) removeParticipant(p *Participant, reason string) {
 	h.events.add("user_left",
 		fmt.Sprintf("%s 离开了房间「%s」", p.Subject, p.room.Name), p.room.ID, p.Subject)
 	h.notifyAgent(p.room.KeyID, protocol.UserLeft{
-		Type:     protocol.TypeUserLeft,
-		RoomID:   p.room.ID,
-		RoomName: p.room.Name,
-		ConnID:   p.ID,
-		Subject:  p.Subject,
-		Reason:   reason,
-		LeftAt:   time.Now().UTC(),
+		Type:      protocol.TypeUserLeft,
+		RoomID:    p.room.ID,
+		RoomName:  p.room.Name,
+		ConnID:    p.ID,
+		Transport: protocol.TransportWebSocket,
+		Subject:   p.Subject,
+		Reason:    reason,
+		LeftAt:    time.Now().UTC(),
 	})
 }
 
@@ -465,6 +494,8 @@ func (h *Hub) ServeAgent(ws *websocket.Conn, keyID, keyName, remoteAddr string) 
 			MaxFrameBytes:        h.cfg.MaxFrameBytes,
 			AuthTimeoutMillis:    int(h.cfg.AuthTimeout / time.Millisecond),
 			MaxParticipantsLimit: h.cfg.MaxParticipantsCap,
+			WebRTC:               h.rtcAPI != nil,
+			MaxTracksPerPeer:     h.cfg.WebRTC.MaxTracksPerPeer,
 		},
 	})
 	h.events.add("agent_online", fmt.Sprintf("使用方「%s」已连接", keyName), "", "")
@@ -507,12 +538,16 @@ func (h *Hub) Snapshot() Snapshot {
 	roomCount := make(map[string]int)
 	participantCount := make(map[string]int)
 	totalParticipants := 0
+	totalRTCPeers := 0
+	totalRTCTracks := 0
 	for _, room := range rooms {
 		info := room.snapshot(online[room.KeyID])
 		roomInfos = append(roomInfos, info)
 		roomCount[room.KeyID]++
 		participantCount[room.KeyID] += info.ParticipantCount
 		totalParticipants += info.ParticipantCount
+		totalRTCPeers += info.RTCPeers
+		totalRTCTracks += info.Tracks
 	}
 	sort.Slice(roomInfos, func(i, j int) bool { return roomInfos[i].CreatedAt.After(roomInfos[j].CreatedAt) })
 
@@ -537,9 +572,13 @@ func (h *Hub) Snapshot() Snapshot {
 			AgentsOnline:    len(agents),
 			ActiveRooms:     len(rooms),
 			Participants:    totalParticipants,
+			RTCPeers:        totalRTCPeers,
+			RTCTracks:       totalRTCTracks,
 			Closed:          closed,
 			MessagesRelayed: h.messagesRelayed.Load(),
 			BytesRelayed:    h.bytesRelayed.Load(),
+			RTPPackets:      h.rtpPackets.Load(),
+			RTPBytes:        h.rtpBytes.Load(),
 			JoinsTotal:      h.joinsTotal.Load(),
 			RoomsCreated:    h.roomsCreated.Load(),
 			AuthRequests:    h.authRequests.Load(),
@@ -575,8 +614,11 @@ func (h *Hub) Shutdown() {
 		agent.failPending(ErrHubClosed)
 	}
 	for _, room := range rooms {
-		participants := room.closeAndDetach()
+		participants, peers := room.closeAndDetach()
 		for _, p := range participants {
+			p.closeWith(websocket.CloseGoingAway, "server shutting down")
+		}
+		for _, p := range peers {
 			p.closeWith(websocket.CloseGoingAway, "server shutting down")
 		}
 		h.events.add("room_closed", eventRoomClosed(room.Name, "server_shutdown"), room.ID, "")
@@ -587,9 +629,13 @@ type StatsSnapshot struct {
 	AgentsOnline    int   `json:"agents_online"`
 	ActiveRooms     int   `json:"active_rooms"`
 	Participants    int   `json:"participants"`
+	RTCPeers        int   `json:"rtc_peers"`
+	RTCTracks       int   `json:"rtc_tracks"`
 	Closed          bool  `json:"closed"`
 	MessagesRelayed int64 `json:"messages_relayed"`
 	BytesRelayed    int64 `json:"bytes_relayed"`
+	RTPPackets      int64 `json:"rtp_packets"`
+	RTPBytes        int64 `json:"rtp_bytes"`
 	JoinsTotal      int64 `json:"joins_total"`
 	RoomsCreated    int64 `json:"rooms_created"`
 	AuthRequests    int64 `json:"auth_requests"`

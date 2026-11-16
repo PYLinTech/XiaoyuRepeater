@@ -28,9 +28,9 @@ const (
 )
 
 type Service struct {
-	store  *store.Store
+	store   *store.Store
 	envHash string
-	ttl    time.Duration
+	ttl     time.Duration
 
 	mu       sync.Mutex
 	sessions map[string]time.Time
