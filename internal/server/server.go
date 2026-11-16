@@ -95,6 +95,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/admin/keys", s.requireAdmin(s.handleAdminKeys))
 	s.mux.HandleFunc("POST /api/admin/keys", s.requireAdmin(s.handleAdminCreateKey))
 	s.mux.HandleFunc("DELETE /api/admin/keys/{id}", s.requireAdmin(s.handleAdminDeleteKey))
+	s.mux.HandleFunc("GET /api/sdk/version", s.handleSDKVersion)
+	s.mux.HandleFunc("GET /api/sdk/download", s.handleSDKDownload)
 
 	s.mux.HandleFunc("POST /v1/rooms", s.handleConsumerCreateRoom)
 	s.mux.HandleFunc("GET /v1/rooms", s.handleConsumerListRooms)

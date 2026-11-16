@@ -385,9 +385,12 @@ function avatarText(subject: string) {
 .people-list {
   display: flex;
   flex-direction: column;
+  margin: 0;
+  padding: 0;
   border: 1px solid var(--border);
   border-radius: 10px;
   overflow: hidden;
+  list-style: none;
 }
 
 .person-row {

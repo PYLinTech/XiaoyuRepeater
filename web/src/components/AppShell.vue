@@ -14,6 +14,7 @@ const navItems = [
   { name: 'overview', label: '概览', icon: 'overview' },
   { name: 'rooms', label: '中转房间', icon: 'rooms' },
   { name: 'keys', label: 'API 密钥', icon: 'keys' },
+  { name: 'sdk', label: 'SDK 下载', icon: 'sdk' },
 ]
 
 const passwordOpen = ref(false)

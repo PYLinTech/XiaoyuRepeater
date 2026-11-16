@@ -107,3 +107,12 @@ export interface RoomsResponse {
 export interface RoomResponse {
   room: RoomInfo
 }
+
+export interface SDKInfo {
+  name: string
+  version: string
+  protocol: number
+  filename: string
+  download_path: string
+  languages: string[]
+}

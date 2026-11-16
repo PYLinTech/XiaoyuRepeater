@@ -5,6 +5,7 @@ import KeysView from './views/KeysView.vue'
 import LoginView from './views/LoginView.vue'
 import OverviewView from './views/OverviewView.vue'
 import RoomsView from './views/RoomsView.vue'
+import SdkView from './views/SdkView.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -18,6 +19,7 @@ const router = createRouter({
         { path: 'overview', name: 'overview', component: OverviewView },
         { path: 'rooms', name: 'rooms', component: RoomsView },
         { path: 'keys', name: 'keys', component: KeysView },
+        { path: 'sdk', name: 'sdk', component: SdkView },
       ],
     },
     { path: '/:pathMatch(.*)*', redirect: '/overview' },

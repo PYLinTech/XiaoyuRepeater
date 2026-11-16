@@ -1,0 +1,26 @@
+{
+  "name": "xiaoyurepeater-sdk",
+  "version": "1.0.0",
+  "description": "XiaoyuRepeater SDK v1 for Node.js",
+  "type": "module",
+  "main": "./xiaoyurepeater-sdk-v1.mjs",
+  "exports": {
+    ".": "./xiaoyurepeater-sdk-v1.mjs"
+  },
+  "files": [
+    "xiaoyurepeater-sdk-v1.mjs",
+    "consumer.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "demo": "node consumer.mjs",
+    "start": "node consumer.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

@@ -31,6 +31,12 @@ const ICONS: Record<string, string> = {
   info: 'ri-information-line',
   refresh: 'ri-refresh-line',
   trash: 'ri-delete-bin-line',
+  sdk: 'ri-code-s-slash-line',
+  download: 'ri-download-2-line',
+  archive: 'ri-file-zip-line',
+  code: 'ri-code-box-line',
+  javascript: 'ri-javascript-line',
+  terminal: 'ri-terminal-box-line',
 }
 
 const iconClass = computed(() => ICONS[props.name] ?? 'ri-question-line')

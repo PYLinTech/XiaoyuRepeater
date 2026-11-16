@@ -65,6 +65,17 @@ npx wscat -c 'ws://127.0.0.1:8080/v1/rooms/<房间ID>/ws?token=demo-token&name=B
 
 启用 WebRTC 时，创建房间响应还会附带 `webrtc_path` / `webrtc_url`。音视频客户端连接该地址并完成同一套实时鉴权后，即可按 [docs/protocol.md](docs/protocol.md) 第 5 节进行 SDP/ICE 信令与 RTP 轨道收发。
 
+### SDK 包
+
+控制台「SDK 下载」页提供使用方客户端包，内含 Go、Node.js、Python 与 curl 示例。包只覆盖控制面：房间管理、使用方通道、鉴权回调、事件与轨道订阅；不包含用户数据或媒体转发逻辑。
+
+- 下载地址：`GET /api/sdk/download`，文件名为 `XiaoyuRepeater_SDK_v1.zip`
+- 版本信息：`GET /api/sdk/version`，无需 API Key
+- 下载的 `config.json` 会自动写入当前控制台地址；跨环境部署时可用 `XR_SERVER` 覆盖
+- SDK 源码位于 `sdk/files/`；修改后运行 `go generate ./sdk` 重新生成嵌入归档 `sdk/XiaoyuRepeater_SDK_v1.zip`，再执行 `make build`
+
+SDK 使用说明、目录结构与各语言快速开始见包内 `README.md`。
+
 ### 开发模式
 
 ```bash
@@ -108,6 +119,8 @@ cd web && npm install && npm run dev
 | `WS` | `/v1/agent` | 使用方鉴权通道（每个密钥同时一个连接） |
 | `WS` | `/v1/rooms/{id}/ws` | 用户加入房间（WebSocket 帧通道） |
 | `WS` | `/v1/rooms/{id}/webrtc` | 用户加入房间（WebRTC 信令与媒体通道） |
+| `GET` | `/api/sdk/version` | SDK 版本信息（公开） |
+| `GET` | `/api/sdk/download` | 下载 SDK 包（公开） |
 | `GET` | `/healthz` | 健康检查 |
 
 管理接口位于 `/api/admin/*`，使用 HttpOnly 会话 Cookie；完整的控制协议、鉴权消息、错误码与转发语义见 [docs/protocol.md](docs/protocol.md)。
@@ -193,6 +206,7 @@ WebRTC 媒体流量走 UDP，不经过 HTTP 反向代理；需要在主机或云
 │   ├── store/              state.json 持久化
 │   └── version/            版本号（可由 ldflags 注入）
 ├── examples/consumer/      使用方示例：创建房间 + 实时鉴权 + 重连
+├── sdk/                    可下载 SDK：嵌入归档、生成器、Go/Node.js/Python/curl 示例
 ├── web/                    Vue 3 + TypeScript 控制台
 ├── docs/protocol.md        协议与错误码
 ├── Dockerfile
@@ -206,6 +220,7 @@ make build        # 构建控制台 + 服务端二进制
 make test         # Go 测试
 make test-race    # 竞态检测
 make docker       # 构建镜像
+go generate ./sdk # 修改 sdk/files/ 后重新生成嵌入归档
 ```
 
 ## 许可证
