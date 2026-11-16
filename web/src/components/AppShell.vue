@@ -253,7 +253,7 @@ async function logout() {
   color: var(--text);
 }
 
-.nav-item.active :deep(svg) {
+.nav-item.active :deep(.ri-icon) {
   color: var(--accent);
 }
 

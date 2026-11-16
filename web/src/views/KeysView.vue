@@ -309,7 +309,7 @@ async function deleteKey() {
   color: var(--text-3);
 }
 
-.list-note :deep(svg) {
+.list-note :deep(.ri-icon) {
   flex-shrink: 0;
   margin-top: 1px;
   color: var(--text-3);
@@ -382,7 +382,7 @@ async function deleteKey() {
   line-height: 1.6;
 }
 
-.secret-alert :deep(svg) {
+.secret-alert :deep(.ri-icon) {
   flex-shrink: 0;
   margin-top: 1px;
 }

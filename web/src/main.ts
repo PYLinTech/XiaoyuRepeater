@@ -3,6 +3,7 @@ import App from './App.vue'
 import router from './router'
 import { setUnauthorizedHandler } from './api'
 import { markLoggedOut } from './auth'
+import './assets/remixicon/remixicon.css'
 import './style.css'
 
 setUnauthorizedHandler(() => {

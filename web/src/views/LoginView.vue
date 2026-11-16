@@ -256,7 +256,7 @@ async function submit() {
   line-height: 1.5;
 }
 
-.login-error :deep(svg) {
+.login-error :deep(.ri-icon) {
   flex-shrink: 0;
   margin-top: 1px;
 }
