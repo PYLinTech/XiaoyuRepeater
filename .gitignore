@@ -1,0 +1,15 @@
+# build output
+/bin/
+/xiaoyurepeater
+
+# runtime data (admin password hash and API key hashes)
+/data/
+*.log
+
+# frontend dependencies
+/web/node_modules/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.vscode
+data
+bin
+*.log
+.DS_Store
+web/node_modules
+web/dist
