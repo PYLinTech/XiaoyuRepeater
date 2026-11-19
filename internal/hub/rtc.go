@@ -27,6 +27,7 @@ const (
 	peerCloseTimeout = 3 * time.Second
 	peerOfferTimeout = 15 * time.Second
 	keyframeInterval = 500 * time.Millisecond
+	keyframeGap      = time.Second
 )
 
 // RTCPeer is a room member whose media is carried by a Pion PeerConnection.
@@ -62,6 +63,7 @@ type RTCPeer struct {
 	pendingOffer   bool
 	initialSynced  bool
 	negotiateTimer *time.Timer
+	keyframeOnSync atomic.Bool
 
 	tracksMu sync.Mutex
 	outbound map[string]*outboundTrack
@@ -88,6 +90,7 @@ type publishedTrack struct {
 	info    protocol.RTCTrack
 	closed  atomic.Bool
 	lastPLI atomic.Int64
+	rtcpMu  sync.Mutex
 
 	subsMu sync.Mutex
 	subs   map[*RTCPeer]*webrtc.TrackLocalStaticRTP
@@ -436,6 +439,10 @@ func (p *RTCPeer) handleAnswer(sdp string) error {
 	p.negMu.Unlock()
 	if more {
 		p.requestNegotiation()
+		return nil
+	}
+	if p.keyframeOnSync.Swap(false) {
+		p.requestOutboundKeyframes()
 	}
 	return nil
 }
@@ -479,6 +486,20 @@ func (p *RTCPeer) syncPublishedTracks() {
 	}
 	for _, pub := range p.room.publishedSnapshot() {
 		p.attachIfWanted(pub)
+	}
+}
+
+func (p *RTCPeer) requestOutboundKeyframes() {
+	p.tracksMu.Lock()
+	pubs := make([]*publishedTrack, 0, len(p.outbound))
+	for _, out := range p.outbound {
+		if out.pub.info.Kind == "video" {
+			pubs = append(pubs, out.pub)
+		}
+	}
+	p.tracksMu.Unlock()
+	for _, pub := range pubs {
+		pub.forceKeyframe()
 	}
 }
 
@@ -685,6 +706,9 @@ func (p *RTCPeer) attachPublished(pub *publishedTrack) {
 	p.tracksMu.Lock()
 	p.everTracks = true
 	p.tracksMu.Unlock()
+	if pub.info.Kind == "video" {
+		p.keyframeOnSync.Store(true)
+	}
 	info := pub.info
 	p.sendSignal(protocol.RTCSignal{Type: protocol.TypeTrackAdded, Track: &info})
 	p.opMu.Unlock()
@@ -967,14 +991,31 @@ func (t *publishedTrack) requestKeyframe() {
 	if !t.lastPLI.CompareAndSwap(last, now) {
 		return
 	}
-	_ = t.owner.pc.WriteRTCP([]rtcp.Packet{
+	t.writeKeyframeRequest()
+}
+
+func (t *publishedTrack) forceKeyframe() {
+	t.lastPLI.Store(time.Now().UnixMilli())
+	t.writeKeyframeRequest()
+}
+
+func (t *publishedTrack) writeKeyframeRequest() {
+	if t.closed.Load() || t.owner.isClosed() {
+		return
+	}
+	t.rtcpMu.Lock()
+	defer t.rtcpMu.Unlock()
+	if err := t.owner.pc.WriteRTCP([]rtcp.Packet{
 		&rtcp.PictureLossIndication{MediaSSRC: uint32(t.remote.SSRC())},
-	})
+	}); err != nil {
+		t.owner.hub.log.Debug("发送关键帧请求失败", "track_id", t.key, "error", err)
+	}
 }
 
 func (t *publishedTrack) readLoop() {
 	buffer := make([]byte, 8192)
 	var packet rtp.Packet
+	var lastVideoPacket time.Time
 	for {
 		n, _, err := t.remote.Read(buffer)
 		if err != nil {
@@ -984,6 +1025,13 @@ func (t *publishedTrack) readLoop() {
 		if err := packet.Unmarshal(buffer[:n]); err != nil {
 			continue
 		}
+		now := time.Now()
+		resumed := t.info.Kind == "video" &&
+			!lastVideoPacket.IsZero() &&
+			now.Sub(lastVideoPacket) >= keyframeGap
+		if t.info.Kind == "video" {
+			lastVideoPacket = now
+		}
 		t.subsMu.Lock()
 		targets := make([]*webrtc.TrackLocalStaticRTP, 0, len(t.subs))
 		for _, local := range t.subs {
@@ -992,6 +1040,9 @@ func (t *publishedTrack) readLoop() {
 		t.subsMu.Unlock()
 		if len(targets) == 0 {
 			continue
+		}
+		if resumed {
+			t.forceKeyframe()
 		}
 		for _, local := range targets {
 			_ = local.WriteRTP(&packet)

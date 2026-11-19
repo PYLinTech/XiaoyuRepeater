@@ -141,7 +141,7 @@ cd web && npm install && npm run dev
 - 服务端只读 RTP 头做路由与统计，payload、扩展与编码参数原样透传；不解码、不转码、不混流、不录制。
 - 使用方可通过鉴权通道的 `subscriptions` 命令，为某个 WebRTC 参与者设置精确订阅列表或 `all=true`；中继只执行列表，不按轨道类型、发布者或业务含义自行选择。默认未设置时为全部订阅，详见 [docs/protocol.md](docs/protocol.md) 第 3.5 节。
 - 轨道发布或结束时，使用方收到 `track_published` / `track_unpublished` 事件；重连后可从 `hello.rooms[].connections` 与 `hello.rooms[].tracks` 恢复在线连接与轨道快照。
-- 订阅者的 PLI/FIR 会转发给发布者以请求关键帧；服务端不缓存关键帧。
+- 新订阅完成协商、以及视频流暂停后恢复时，服务端会主动向发布者请求关键帧；订阅者的 PLI/FIR 同样会转发，服务端不缓存关键帧。
 - 每个参与者最多发布 `XR_WEBRTC_MAX_TRACKS_PER_PEER` 条轨道；超限时返回信令 `error` 并忽略后续轨道。
 - WS 与 WebRTC 参与者共享房间人数上限与在线列表；两种通道互不影响，可在同一房间并行使用。
 
