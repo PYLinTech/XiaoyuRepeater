@@ -26,6 +26,7 @@ const (
 	peerWriteTimeout = 10 * time.Second
 	peerCloseTimeout = 3 * time.Second
 	peerOfferTimeout = 15 * time.Second
+	offerRetryLimit  = 2
 	keyframeInterval = 500 * time.Millisecond
 	keyframeGap      = time.Second
 )
@@ -61,6 +62,7 @@ type RTCPeer struct {
 	needOffer      bool
 	negotiating    bool
 	pendingOffer   bool
+	offerRetries   int
 	initialSynced  bool
 	negotiateTimer *time.Timer
 	keyframeOnSync atomic.Bool
@@ -305,6 +307,10 @@ func (p *RTCPeer) readLoop() {
 		case protocol.TypeBye:
 			p.finish("client_closed")
 			return
+		case protocol.TypeRequestKeyframe:
+			if msg.Track != nil {
+				p.requestOutboundKeyframe(msg.Track.ID)
+			}
 		case protocol.TypePing:
 			p.sendSignal(protocol.RTCSignal{Type: protocol.TypePong})
 		default:
@@ -375,6 +381,7 @@ func (p *RTCPeer) handleOffer(sdp string) error {
 		p.negMu.Lock()
 		p.pendingOffer = false
 		p.needOffer = true
+		p.offerRetries = 0
 		p.stopOfferTimerLocked()
 		p.negMu.Unlock()
 		resume = true
@@ -403,6 +410,7 @@ func (p *RTCPeer) handleOffer(sdp string) error {
 	p.negMu.Lock()
 	first := !p.initialSynced
 	p.initialSynced = true
+	p.offerRetries = 0
 	p.negMu.Unlock()
 	p.sendSignal(protocol.RTCSignal{Type: protocol.TypeAnswer, SDP: local.SDP})
 
@@ -424,6 +432,12 @@ func (p *RTCPeer) handleAnswer(sdp string) error {
 		return nil
 	}
 	if p.pc.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+		p.negMu.Lock()
+		retry := p.needOffer
+		p.negMu.Unlock()
+		if retry {
+			p.requestNegotiation()
+		}
 		return fmt.Errorf("no local offer to answer")
 	}
 	if err := p.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp}); err != nil {
@@ -434,6 +448,7 @@ func (p *RTCPeer) handleAnswer(sdp string) error {
 
 	p.negMu.Lock()
 	p.pendingOffer = false
+	p.offerRetries = 0
 	p.stopOfferTimerLocked()
 	more := p.needOffer
 	p.negMu.Unlock()
@@ -501,6 +516,19 @@ func (p *RTCPeer) requestOutboundKeyframes() {
 	for _, pub := range pubs {
 		pub.forceKeyframe()
 	}
+	for _, pub := range pubs {
+		go pub.retryKeyframes()
+	}
+}
+
+func (p *RTCPeer) requestOutboundKeyframe(key string) {
+	p.tracksMu.Lock()
+	out := p.outbound[key]
+	p.tracksMu.Unlock()
+	if out == nil || out.pub.info.Kind != "video" {
+		return
+	}
+	out.pub.requestKeyframe()
 }
 
 func (p *RTCPeer) isInitialSynced() bool {
@@ -713,6 +741,10 @@ func (p *RTCPeer) attachPublished(pub *publishedTrack) {
 	p.sendSignal(protocol.RTCSignal{Type: protocol.TypeTrackAdded, Track: &info})
 	p.opMu.Unlock()
 
+	p.hub.log.Info("WebRTC 轨道已订阅",
+		"room_id", p.room.ID, "peer_id", p.ID, "track_id", pub.key,
+		"publisher_id", pub.owner.ID, "kind", pub.info.Kind)
+
 	go p.drainRTCP(pub, sender)
 	p.requestNegotiation()
 }
@@ -887,17 +919,52 @@ func (p *RTCPeer) negotiate() {
 	p.stopOfferTimerLocked()
 	var timer *time.Timer
 	timer = time.AfterFunc(peerOfferTimeout, func() {
-		p.negMu.Lock()
-		timedOut := p.negotiateTimer == timer && p.pendingOffer && !p.isClosed()
-		p.negMu.Unlock()
-		if timedOut {
-			p.hub.log.Warn("WebRTC 重协商超时", "peer_id", p.ID)
-			go p.finish("negotiation_timeout")
-		}
+		p.handleOfferTimeout(timer)
 	})
 	p.negotiateTimer = timer
 	p.negMu.Unlock()
 	p.sendSignal(protocol.RTCSignal{Type: protocol.TypeOffer, SDP: local.SDP})
+}
+
+// handleOfferTimeout rolls back an unanswered offer and retries instead of
+// tearing down the session. Backgrounded clients resume answering on wake.
+func (p *RTCPeer) handleOfferTimeout(timer *time.Timer) {
+	p.opMu.Lock()
+	p.negMu.Lock()
+	if p.negotiateTimer != timer || !p.pendingOffer || p.isClosed() {
+		p.negMu.Unlock()
+		p.opMu.Unlock()
+		return
+	}
+	p.pendingOffer = false
+	p.negotiateTimer = nil
+	p.needOffer = true
+	p.offerRetries++
+	retry := p.offerRetries
+	p.negMu.Unlock()
+
+	if p.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
+		if err := p.pc.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
+			p.opMu.Unlock()
+			p.hub.log.Warn("回滚 WebRTC offer 失败", "error", err, "peer_id", p.ID)
+			go p.finish("sdp_error")
+			return
+		}
+	}
+	p.opMu.Unlock()
+
+	p.hub.log.Warn("WebRTC 重协商超时，保留连接", "peer_id", p.ID, "retry", retry)
+	if retry > offerRetryLimit {
+		return
+	}
+	time.AfterFunc(time.Duration(retry)*2*time.Second, func() {
+		p.negMu.Lock()
+		ready := !p.isClosed() && p.needOffer && !p.pendingOffer && !p.negotiating
+		p.negMu.Unlock()
+		if ready {
+			p.requestNegotiation()
+		}
+	})
 }
 
 // stopOfferTimerLocked must be called with negMu held.
@@ -997,6 +1064,16 @@ func (t *publishedTrack) requestKeyframe() {
 func (t *publishedTrack) forceKeyframe() {
 	t.lastPLI.Store(time.Now().UnixMilli())
 	t.writeKeyframeRequest()
+}
+
+func (t *publishedTrack) retryKeyframes() {
+	for range 3 {
+		time.Sleep(400 * time.Millisecond)
+		if t.closed.Load() || t.owner.isClosed() {
+			return
+		}
+		t.forceKeyframe()
+	}
 }
 
 func (t *publishedTrack) writeKeyframeRequest() {

@@ -25,6 +25,7 @@ const (
 	TypeTrackUnpublished     = "track_unpublished"
 	TypeSubscriptions        = "subscriptions"
 	TypeSubscriptionsUpdated = "subscriptions_updated"
+	TypeRequestKeyframe      = "request_keyframe"
 )
 
 const (
