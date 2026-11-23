@@ -28,6 +28,8 @@ const (
 	TypeTrackUnpublished     = "track_unpublished"
 	TypeSubscriptions        = "subscriptions"
 	TypeSubscriptionsUpdated = "subscriptions_updated"
+	TypeDisconnect           = "disconnect"
+	TypeDisconnected         = "disconnected"
 	TypeRequestKeyframe      = "request_keyframe"
 )
 
@@ -161,6 +163,7 @@ type RTCSignal struct {
 	SDP       string        `json:"sdp,omitempty"`
 	Candidate *ICECandidate `json:"candidate,omitempty"`
 	Track     *RTCTrack     `json:"track,omitempty"`
+	Tracks    []RTCTrack    `json:"tracks,omitempty"`
 	Error     string        `json:"error,omitempty"`
 }
 
@@ -179,6 +182,7 @@ type RTCTrack struct {
 	StreamID    string `json:"stream_id"`
 	Codec       string `json:"codec"`
 	RID         string `json:"rid,omitempty"`
+	MID         string `json:"mid,omitempty"`
 	PublisherID string `json:"publisher_id"`
 	Subject     string `json:"subject,omitempty"`
 }
@@ -244,4 +248,23 @@ type AgentError struct {
 	RoomID    string `json:"room_id,omitempty"`
 	ConnID    string `json:"conn_id,omitempty"`
 	Error     string `json:"error"`
+}
+
+// DisconnectCommand asks the relay to close one specific room connection
+// (either ws or webrtc) immediately, freeing its tracks and room slot.
+type DisconnectCommand struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id"`
+	RoomID    string `json:"room_id"`
+	ConnID    string `json:"conn_id"`
+	Code      int    `json:"code,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type DisconnectedResult struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id"`
+	RoomID    string `json:"room_id"`
+	ConnID    string `json:"conn_id"`
+	Closed    bool   `json:"closed"`
 }

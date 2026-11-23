@@ -1,6 +1,8 @@
 package hub
 
 import (
+	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,7 +12,8 @@ import (
 )
 
 const (
-	dropLogInterval = 5 * time.Second
+	dropLogInterval    = 5 * time.Second
+	maxWriteErrorStreak = 5
 )
 
 // downlink is one subscription: a per-subscriber queue plus a writer that
@@ -18,18 +21,20 @@ const (
 // blocks on a slow subscriber; the queue is bounded and applies a per-kind
 // drop policy instead.
 type downlink struct {
-	peer       *RTCPeer
-	pub        *publishedTrack
-	local      *webrtc.TrackLocalStaticRTP
-	sender     *webrtc.RTPSender
-	video      bool
-	detectable bool
+	peer        *RTCPeer
+	pub         *publishedTrack
+	local       *webrtc.TrackLocalStaticRTP
+	transceiver *webrtc.RTPTransceiver
+	sender      *webrtc.RTPSender
+	video       bool
+	detectable  bool
 
 	queue     chan []byte
 	done      chan struct{}
 	closeOnce sync.Once
 
 	dropped     atomic.Int64
+	negotiated  atomic.Bool
 	waiting     atomic.Bool
 	stopped     atomic.Bool
 	pliIssued   atomic.Bool
@@ -41,16 +46,17 @@ type downlink struct {
 	pliBackoff time.Duration
 }
 
-func newDownlink(p *RTCPeer, pub *publishedTrack, local *webrtc.TrackLocalStaticRTP, sender *webrtc.RTPSender, queueSize int) *downlink {
+func newDownlink(p *RTCPeer, pub *publishedTrack, local *webrtc.TrackLocalStaticRTP, transceiver *webrtc.RTPTransceiver, sender *webrtc.RTPSender, queueSize int) *downlink {
 	video := pub.info.Kind == "video"
 	d := &downlink{
-		peer:   p,
-		pub:    pub,
-		local:  local,
-		sender: sender,
-		video:  video,
-		queue:  make(chan []byte, queueSize),
-		done:   make(chan struct{}),
+		peer:        p,
+		pub:         pub,
+		local:       local,
+		transceiver: transceiver,
+		sender:      sender,
+		video:       video,
+		queue:       make(chan []byte, queueSize),
+		done:        make(chan struct{}),
 	}
 	if video {
 		d.detectable = pub.keyframeProbe.detectable()
@@ -151,6 +157,7 @@ func (d *downlink) run() {
 		d.drainQueue()
 	}()
 	var packet rtp.Packet
+	writeErrors := 0
 	for {
 		select {
 		case <-d.done:
@@ -163,10 +170,16 @@ func (d *downlink) run() {
 				continue
 			}
 			if err := d.local.WriteRTP(&packet); err != nil {
-				d.peer.postReliable(peerCommand{kind: cmdDownlinkFailed, key: d.pub.key})
-				return
+				writeErrors++
+				fatal := errors.Is(err, io.ErrClosedPipe) || errors.Is(err, webrtc.ErrConnectionClosed)
+				if fatal || writeErrors >= maxWriteErrorStreak {
+					d.peer.postReliable(peerCommand{kind: cmdDownlinkFailed, key: d.pub.key})
+					return
+				}
+				continue
 			}
-			if d.video && !d.detectable && d.pliIssued.Swap(false) {
+			writeErrors = 0
+			if d.video && !d.detectable && d.negotiated.Load() && d.pliIssued.Swap(false) {
 				d.waiting.Store(false)
 			}
 		}

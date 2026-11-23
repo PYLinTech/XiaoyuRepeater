@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -35,7 +36,10 @@ type WebRTCConfig struct {
 	Enabled           bool
 	UDPPortMin        int
 	UDPPortMax        int
+	UDPMuxPort        int
+	TCPMuxPort        int
 	PublicIPs         []string
+	ICEServers        []string
 	MaxTracksPerPeer  int
 	VideoQueuePackets int
 	AudioQueuePackets int
@@ -46,10 +50,12 @@ type WebRTCConfig struct {
 }
 
 type Hub struct {
-	cfg    Config
-	log    *slog.Logger
-	start  time.Time
-	rtcAPI *webrtc.API
+	cfg        Config
+	log        *slog.Logger
+	start      time.Time
+	rtcAPI     *webrtc.API
+	iceServers []webrtc.ICEServer
+	rtcClosers []io.Closer
 
 	mu     sync.RWMutex
 	rooms  map[string]*Room
@@ -110,11 +116,15 @@ func New(cfg Config, log *slog.Logger) (*Hub, error) {
 		stop:   make(chan struct{}),
 	}
 	if cfg.WebRTC.Enabled {
-		api, err := newWebRTCAPI(cfg.WebRTC)
+		api, closers, err := newWebRTCAPI(cfg.WebRTC)
 		if err != nil {
 			return nil, err
 		}
 		h.rtcAPI = api
+		h.rtcClosers = closers
+		if len(cfg.WebRTC.ICEServers) > 0 {
+			h.iceServers = []webrtc.ICEServer{{URLs: append([]string(nil), cfg.WebRTC.ICEServers...)}}
+		}
 	}
 	h.wg.Add(1)
 	go h.janitor()
@@ -628,7 +638,7 @@ func (h *Hub) ServeAgent(ws *websocket.Conn, keyID, keyName, remoteAddr string) 
 		KeyName:    keyName,
 		ServerTime: time.Now().UTC(),
 		Rooms:      refs,
-		Features:   []string{"subscription_ack", "subscription_snapshot", "room_metadata"},
+		Features:   []string{"subscription_ack", "subscription_snapshot", "room_metadata", "disconnect_connection"},
 		Limits: protocol.Limits{
 			MaxRooms:             h.cfg.MaxRoomsPerKey,
 			MaxFrameBytes:        h.cfg.MaxFrameBytes,
@@ -795,6 +805,9 @@ func (h *Hub) Shutdown() {
 			p.closeWith(websocket.CloseGoingAway, "server shutting down")
 		}
 		h.events.add("room_closed", eventRoomClosed(room.Name, "server_shutdown"), room.ID, "")
+	}
+	for _, closer := range h.rtcClosers {
+		_ = closer.Close()
 	}
 }
 

@@ -29,7 +29,10 @@ type Config struct {
 	WebRTCEnabled          bool
 	WebRTCUDPPortMin       int
 	WebRTCUDPPortMax       int
+	WebRTCUDPMuxPort       int
+	WebRTCTCPMuxPort       int
 	WebRTCPublicIPs        []string
+	WebRTCICEServers       []string
 	WebRTCMaxTracksPerPeer int
 	WebRTCVideoQueue       int
 	WebRTCAudioQueue       int
@@ -60,7 +63,10 @@ func Load() (Config, error) {
 		WebRTCEnabled:          envBool("XR_WEBRTC_ENABLED", true),
 		WebRTCUDPPortMin:       envInt("XR_WEBRTC_UDP_PORT_MIN", 50000),
 		WebRTCUDPPortMax:       envInt("XR_WEBRTC_UDP_PORT_MAX", 50100),
+		WebRTCUDPMuxPort:       envInt("XR_WEBRTC_UDP_MUX_PORT", 0),
+		WebRTCTCPMuxPort:       envInt("XR_WEBRTC_TCP_MUX_PORT", 0),
 		WebRTCPublicIPs:        envList("XR_WEBRTC_PUBLIC_IP"),
+		WebRTCICEServers:       envList("XR_WEBRTC_ICE_SERVERS"),
 		WebRTCMaxTracksPerPeer: envInt("XR_WEBRTC_MAX_TRACKS_PER_PEER", 8),
 		WebRTCVideoQueue:       envInt("XR_WEBRTC_VIDEO_QUEUE", 256),
 		WebRTCAudioQueue:       envInt("XR_WEBRTC_AUDIO_QUEUE", 200),
@@ -118,6 +124,12 @@ func Load() (Config, error) {
 	}
 	if cfg.WebRTCUDPPortMin > cfg.WebRTCUDPPortMax {
 		return cfg, fmt.Errorf("XR_WEBRTC_UDP_PORT_MIN 不能大于 XR_WEBRTC_UDP_PORT_MAX")
+	}
+	if cfg.WebRTCUDPMuxPort != 0 && (cfg.WebRTCUDPMuxPort < 1024 || cfg.WebRTCUDPMuxPort > 65535) {
+		return cfg, fmt.Errorf("XR_WEBRTC_UDP_MUX_PORT 需要为 0（关闭）或 1024 到 65535 之间")
+	}
+	if cfg.WebRTCTCPMuxPort != 0 && (cfg.WebRTCTCPMuxPort < 1024 || cfg.WebRTCTCPMuxPort > 65535) {
+		return cfg, fmt.Errorf("XR_WEBRTC_TCP_MUX_PORT 需要为 0（关闭）或 1024 到 65535 之间")
 	}
 	for _, ip := range cfg.WebRTCPublicIPs {
 		if net.ParseIP(ip) == nil {

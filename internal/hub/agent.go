@@ -2,6 +2,7 @@ package hub
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 
@@ -131,6 +132,7 @@ func (a *Agent) readLoop() {
 			a.hub.log.Warn("忽略使用方非文本消息", "agent_id", a.id)
 			continue
 		}
+		_ = a.ws.SetReadDeadline(time.Now().Add(agentReadTimeout))
 		var envelope struct {
 			Type string `json:"type"`
 		}
@@ -153,6 +155,13 @@ func (a *Agent) readLoop() {
 				continue
 			}
 			a.enqueueSubscriptions(cmd)
+		case protocol.TypeDisconnect:
+			var cmd protocol.DisconnectCommand
+			if err := json.Unmarshal(raw, &cmd); err != nil {
+				a.hub.log.Warn("解析断开连接命令失败", "error", err, "agent_id", a.id)
+				continue
+			}
+			go a.handleDisconnect(cmd)
 		case protocol.TypePing:
 			a.sendJSON(protocol.Pong{Type: protocol.TypePong, Time: time.Now().UTC()})
 		case protocol.TypePong:
@@ -247,6 +256,78 @@ func (a *Agent) sendCommandError(cmd protocol.SubscriptionsCommand, message stri
 		RoomID:    cmd.RoomID,
 		ConnID:    cmd.ConnID,
 		Error:     message,
+	})
+}
+
+func (a *Agent) handleDisconnect(cmd protocol.DisconnectCommand) {
+	if cmd.RequestID == "" {
+		a.sendJSON(protocol.AgentError{
+			Type:   protocol.TypeError,
+			RoomID: cmd.RoomID,
+			ConnID: cmd.ConnID,
+			Error:  "request_id 不能为空",
+		})
+		return
+	}
+	if cmd.RoomID == "" || cmd.ConnID == "" {
+		a.sendJSON(protocol.AgentError{
+			Type:      protocol.TypeError,
+			RequestID: cmd.RequestID,
+			RoomID:    cmd.RoomID,
+			ConnID:    cmd.ConnID,
+			Error:     "room_id 和 conn_id 不能为空",
+		})
+		return
+	}
+
+	a.hub.mu.RLock()
+	room := a.hub.rooms[cmd.RoomID]
+	owned := room != nil && room.KeyID == a.keyID && a.hub.agents[a.keyID] == a
+	a.hub.mu.RUnlock()
+	if !owned {
+		a.sendJSON(protocol.AgentError{
+			Type:      protocol.TypeError,
+			RequestID: cmd.RequestID,
+			RoomID:    cmd.RoomID,
+			ConnID:    cmd.ConnID,
+			Error:     "房间不存在或不属于当前密钥",
+		})
+		return
+	}
+	if room.isClosed() {
+		a.sendJSON(protocol.AgentError{
+			Type:      protocol.TypeError,
+			RequestID: cmd.RequestID,
+			RoomID:    cmd.RoomID,
+			ConnID:    cmd.ConnID,
+			Error:     "房间已关闭",
+		})
+		return
+	}
+
+	code := cmd.Code
+	if code != websocket.CloseNormalClosure && (code < 4000 || code > 4999) {
+		code = 4001
+	}
+	reason := cleanString(strings.TrimSpace(cmd.Reason), 120, "disconnected by consumer")
+
+	closed := false
+	if peer := room.peerByID(cmd.ConnID); peer != nil && !peer.isClosed() {
+		peer.closeWith(code, reason)
+		peer.finish("consumer_disconnected")
+		closed = true
+	} else if part := room.participantByID(cmd.ConnID); part != nil {
+		part.closeWith(code, reason)
+		part.finish("consumer_disconnected")
+		closed = true
+	}
+
+	a.sendJSON(protocol.DisconnectedResult{
+		Type:      protocol.TypeDisconnected,
+		RequestID: cmd.RequestID,
+		RoomID:    cmd.RoomID,
+		ConnID:    cmd.ConnID,
+		Closed:    closed,
 	})
 }
 

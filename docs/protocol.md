@@ -173,7 +173,7 @@ Authorization: Bearer <API密钥>
       ]
     }
   ],
-  "features": ["subscription_ack", "subscription_snapshot", "room_metadata"],
+  "features": ["subscription_ack", "subscription_snapshot", "room_metadata", "disconnect_connection"],
   "limits": {
     "max_rooms": 100,
     "max_frame_bytes": 1048576,
@@ -419,7 +419,36 @@ Authorization: Bearer <API密钥>
 - 响应中的 `track_ids` 是去重、去掉空白后的列表；`all: true` 时为空。
 - 轨道 ID 来自 `track_published` / `track_added`；使用方重连后可从 `hello.rooms[].connections` 恢复已有参与者，并从 `hello.rooms[].tracks` 获取轨道快照，从而重新下发订阅。
 
-### 3.6 断开与密钥撤销
+### 3.6 主动断开单个连接
+
+使用方可通过控制通道立即关闭自己名下某个房间内的指定连接（`ws` 或 `webrtc`），释放其发布的轨道与房间名额：
+
+```json
+{
+  "type": "disconnect",
+  "request_id": "dc_xxxxxxxx",
+  "room_id": "r_xxxxxxxxx",
+  "conn_id": "p_xxxxxxxx",
+  "code": 4001,
+  "reason": "replaced by new connection"
+}
+```
+
+响应：
+
+```json
+{
+  "type": "disconnected",
+  "request_id": "dc_xxxxxxxx",
+  "room_id": "r_xxxxxxxxx",
+  "conn_id": "p_xxxxxxxx",
+  "closed": true
+}
+```
+
+`code` 仅允许 `1000` 或 `4000–4999`（默认 `4001`）。若目标连接已离开，返回 `closed: false`；房间不存在或不属于当前密钥返回 `error`。
+
+### 3.7 断开与密钥撤销
 
 - 使用方通道断开后，房间保留；新用户加入返回 `503 agent_offline`，已有用户连接不受影响。
 - 使用方持续离线超过 `XR_ROOM_ORPHAN_TTL`（默认 30 分钟）后，其房间会被回收：在线用户收到 `4000` 关闭、`room_closed.reason` 为 `room_expired`，使用方下次连接时不再看到该房间。检查周期由 `XR_ROOM_SWEEP_INTERVAL`（默认 15 秒）控制。
@@ -599,13 +628,14 @@ X-Repeater-Transport: webrtc
 2. 客户端发送首个 `offer`；服务端回 `answer`。
 3. 服务端在首个 offer/answer 完成后，按该连接当前订阅状态（未设置过时默认全部）把房间内已有轨道挂到该连接，并发送 `track_added`，随后主动发送 `offer`；客户端回 `answer`。
 4. 后续任何一方新增轨道都会触发服务端重协商：服务端发送 `offer`，客户端回 `answer`。
-5. ICE 候选可随时双向发送。服务端 offer 在 15 秒内未收到 answer 时回滚本地 offer，按指数退避（1 秒起、最长 15 秒）无限重试，不因重试次数关闭连接。
+5. ICE 候选可随时双向发送。服务端 offer 在 15 秒内未收到 answer 时按指数退避（1 秒起、最长 15 秒）重发当前 offer，不因重试次数关闭连接。
 6. 连接进入 `disconnected`/`failed` 超过 5 秒后，服务端以 `iceRestart` 重新发起 offer；重试间隔按 2 秒起的指数退避增长（最长 30 秒），连续失联超过 2 分钟才关闭该连接。
 
 注意事项：
 
 - 服务端不会先于客户端发起首个 offer；客户端必须主动发送 offer，否则无法建立媒体连接。
-- 若客户端在服务端 offer 尚未应答时发送新的 offer，服务端会回滚自己的本地 offer、处理客户端 offer，并在信令稳定后重新发起服务端 offer。
+- 协商冲突（Glare）约定服务端为 impolite 端、客户端为 polite 端：若客户端在服务端 offer 尚未应答时发送新的 offer，服务端会忽略碰撞的客户端 offer，客户端应在收到服务端 offer 后回滚自身本地 offer、先应答服务端 offer，再重新发起自己的 offer。
+- 服务端发送的 `offer` 会附带当前已挂载下行轨道列表 `tracks`（每项包含解析后的 `mid`），`track_removed` 也会尽可能携带 `mid`，便于客户端按 `transceiver.mid` 精确映射远端轨道；老客户端可忽略新增字段。
 - 默认每个参与者订阅房间内所有已发布轨道；使用方可在控制通道通过 `subscriptions` 为某个参与者设置精确轨道列表或 `all=true`，详见 3.5。中继只执行使用方给出的列表，不按轨道类型或业务含义自行挑选。
 - 每个参与者最多发布 `XR_WEBRTC_MAX_TRACKS_PER_PEER` 条轨道（默认 8，范围 1–32），超限时服务端发送 `error` 并忽略后续轨道。
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -187,28 +189,63 @@ type publishedTrack struct {
 	subsView atomic.Pointer[[]*downlink]
 }
 
-func newWebRTCAPI(cfg WebRTCConfig) (*webrtc.API, error) {
+func newWebRTCAPI(cfg WebRTCConfig) (*webrtc.API, []io.Closer, error) {
 	engine := &webrtc.MediaEngine{}
 	if err := engine.RegisterDefaultCodecs(); err != nil {
-		return nil, fmt.Errorf("注册 WebRTC 编解码能力失败: %w", err)
+		return nil, nil, fmt.Errorf("注册 WebRTC 编解码能力失败: %w", err)
 	}
 	settings := webrtc.SettingEngine{}
-	if err := settings.SetEphemeralUDPPortRange(uint16(cfg.UDPPortMin), uint16(cfg.UDPPortMax)); err != nil {
-		return nil, fmt.Errorf("设置 WebRTC UDP 端口范围失败: %w", err)
+	var closers []io.Closer
+	closeAll := func() {
+		for _, closer := range closers {
+			_ = closer.Close()
+		}
+	}
+	if cfg.UDPMuxPort > 0 {
+		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: cfg.UDPMuxPort})
+		if err != nil {
+			return nil, nil, fmt.Errorf("监听 WebRTC UDP Mux 端口失败: %w", err)
+		}
+		udpMux := webrtc.NewICEUDPMux(nil, udpConn)
+		closers = append(closers, udpMux)
+		settings.SetICEUDPMux(udpMux)
+	} else {
+		if err := settings.SetEphemeralUDPPortRange(uint16(cfg.UDPPortMin), uint16(cfg.UDPPortMax)); err != nil {
+			return nil, nil, fmt.Errorf("设置 WebRTC UDP 端口范围失败: %w", err)
+		}
+	}
+	if cfg.TCPMuxPort > 0 {
+		tcpListener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.TCPMuxPort))
+		if err != nil {
+			closeAll()
+			return nil, nil, fmt.Errorf("监听 WebRTC TCP Mux 端口失败: %w", err)
+		}
+		tcpMux := webrtc.NewICETCPMux(nil, tcpListener, 8<<20)
+		closers = append(closers, tcpMux)
+		settings.SetICETCPMux(tcpMux)
+		settings.SetNetworkTypes([]webrtc.NetworkType{
+			webrtc.NetworkTypeUDP4,
+			webrtc.NetworkTypeUDP6,
+			webrtc.NetworkTypeTCP4,
+			webrtc.NetworkTypeTCP6,
+		})
 	}
 	if len(cfg.PublicIPs) > 0 {
 		if err := settings.SetICEAddressRewriteRules(webrtc.ICEAddressRewriteRule{
 			External:        cfg.PublicIPs,
 			AsCandidateType: webrtc.ICECandidateTypeHost,
 		}); err != nil {
-			return nil, fmt.Errorf("设置 WebRTC 公网地址失败: %w", err)
+			closeAll()
+			return nil, nil, fmt.Errorf("设置 WebRTC 公网地址失败: %w", err)
 		}
 	}
-	return webrtc.NewAPI(webrtc.WithMediaEngine(engine), webrtc.WithSettingEngine(settings)), nil
+	return webrtc.NewAPI(webrtc.WithMediaEngine(engine), webrtc.WithSettingEngine(settings)), closers, nil
 }
 
 func newRTCPeer(h *Hub, room *Room, ws *websocket.Conn, decision Decision, remoteAddr, userAgent string) (*RTCPeer, error) {
-	pc, err := h.rtcAPI.NewPeerConnection(webrtc.Configuration{})
+	pc, err := h.rtcAPI.NewPeerConnection(webrtc.Configuration{
+		ICEServers: h.iceServers,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -780,14 +817,16 @@ func (p *RTCPeer) onOffer(sdp string) error {
 		return fmt.Errorf("empty offer")
 	}
 	st := &p.state
-	resume := false
+	// SFU 作为 impolite 端：若本地仍有未应答的 offer，不调用 Pion 未实现的 rollback，
+	// 直接忽略碰撞的客户端 offer，由 polite 客户端回滚并先应答服务端 offer。
 	if p.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
-		if err := p.pc.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
-			return fmt.Errorf("rollback local offer: %w", err)
+		if !st.pendingOffer {
+			st.pendingOffer = true
+			st.offerSentAt = time.Now()
 		}
-		st.needOffer = true
-		st.offerRetries = 0
-		resume = true
+		p.hub.log.Debug("WebRTC 协商冲突，忽略客户端 offer 等待其应答服务端 offer",
+			"room_id", p.room.ID, "peer_id", p.ID)
+		return nil
 	}
 	st.pendingOffer = false
 	if state := p.pc.SignalingState(); state != webrtc.SignalingStateStable {
@@ -820,7 +859,7 @@ func (p *RTCPeer) onOffer(sdp string) error {
 
 	if first {
 		p.reconcile()
-	} else if resume {
+	} else if st.needOffer {
 		p.requestNegotiation()
 	}
 	return nil
@@ -849,11 +888,18 @@ func (p *RTCPeer) onAnswer(sdp string) error {
 	st.offerRetries = 0
 	st.restarting = false
 	st.retryAt = time.Time{}
+	now := time.Now()
+	for _, dl := range st.outbound {
+		if !dl.negotiated.Swap(true) && dl.video {
+			dl.markKeyframeNeeded()
+		}
+	}
+	p.kickPendingKeyframes(now)
+	p.tickKeyframes(now)
 	if st.needOffer {
 		p.requestNegotiation()
 		return nil
 	}
-	p.kickPendingKeyframes(time.Now())
 	return nil
 }
 
@@ -1032,17 +1078,20 @@ func (p *RTCPeer) attachLocked(pub *publishedTrack) bool {
 			"error", err, "room_id", p.room.ID, "peer_id", p.ID, "track_id", pub.key)
 		return false
 	}
-	sender, err := p.pc.AddTrack(local)
+	tr, err := p.pc.AddTransceiverFromTrack(local, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
 	if err != nil {
 		p.hub.log.Warn("添加转发轨道失败",
 			"error", err, "room_id", p.room.ID, "peer_id", p.ID, "track_id", pub.key)
 		return false
 	}
+	sender := tr.Sender()
 	queue := p.hub.cfg.WebRTC.AudioQueuePackets
 	if pub.video {
 		queue = p.hub.cfg.WebRTC.VideoQueuePackets
 	}
-	dl := newDownlink(p, pub, local, sender, queue)
+	dl := newDownlink(p, pub, local, tr, sender, queue)
 	if !pub.addSubscriber(p, dl) {
 		_ = p.pc.RemoveTrack(sender)
 		return false
@@ -1078,6 +1127,9 @@ func (p *RTCPeer) detachLocked(key string) bool {
 		_ = p.pc.RemoveTrack(dl.sender)
 	}
 	info := dl.pub.info
+	if dl.transceiver != nil {
+		info.MID = dl.transceiver.Mid()
+	}
 	p.sendSignal(protocol.RTCSignal{Type: protocol.TypeTrackRemoved, Track: &info})
 	p.hub.log.Info("WebRTC 轨道已退订",
 		"room_id", p.room.ID, "peer_id", p.ID, "track_id", key, "kind", info.Kind)
@@ -1100,6 +1152,22 @@ func (p *RTCPeer) requestNegotiation() {
 	}
 	p.state.needOffer = true
 	p.tryNegotiate(time.Now())
+}
+
+func (p *RTCPeer) outboundTracks() []protocol.RTCTrack {
+	if len(p.state.outbound) == 0 {
+		return nil
+	}
+	tracks := make([]protocol.RTCTrack, 0, len(p.state.outbound))
+	for _, dl := range p.state.outbound {
+		info := dl.pub.info
+		if dl.transceiver != nil {
+			info.MID = dl.transceiver.Mid()
+		}
+		tracks = append(tracks, info)
+	}
+	sort.Slice(tracks, func(i, j int) bool { return tracks[i].ID < tracks[j].ID })
+	return tracks
 }
 
 func (p *RTCPeer) tryNegotiate(now time.Time) {
@@ -1139,7 +1207,12 @@ func (p *RTCPeer) tryNegotiate(now time.Time) {
 	st.needOffer = false
 	st.pendingOffer = true
 	st.offerSentAt = now
-	p.sendSignal(protocol.RTCSignal{Type: protocol.TypeOffer, SDP: local.SDP})
+	st.retryAt = time.Time{}
+	p.sendSignal(protocol.RTCSignal{
+		Type:   protocol.TypeOffer,
+		SDP:    local.SDP,
+		Tracks: p.outboundTracks(),
+	})
 }
 
 func (p *RTCPeer) negotiationFailed(stage string, err error) {
@@ -1181,33 +1254,35 @@ func (p *RTCPeer) expireRetrySkips(now time.Time) bool {
 	return expired
 }
 
-// tickOffer rolls back an unanswered offer and retries with backoff instead of
+// tickOffer resends an unanswered offer with backoff instead of rolling back or
 // tearing down the session; backgrounded clients resume answering on wake.
 func (p *RTCPeer) tickOffer(now time.Time) {
 	st := &p.state
 	if st.pendingOffer {
-		if now.Sub(st.offerSentAt) < peerOfferTimeout {
+		due := st.retryAt
+		if due.IsZero() {
+			due = st.offerSentAt.Add(peerOfferTimeout)
+		}
+		if now.Before(due) {
 			return
 		}
-		st.pendingOffer = false
-		st.needOffer = true
+		if p.pc.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+			st.pendingOffer = false
+			st.retryAt = time.Time{}
+			return
+		}
 		st.offerRetries++
-		if p.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
-			if err := p.pc.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
-				p.negotiationFailed("rollback_offer", err)
-				return
-			}
-		}
 		backoff := offerRetryDelay(st.offerRetries)
+		st.offerSentAt = now
 		st.retryAt = now.Add(backoff)
-		if st.restarting {
-			st.restarting = false
-			st.needOffer = false
-			if st.disconnectedAt.IsZero() {
-				st.disconnectedAt = now
-			}
+		if local := p.pc.LocalDescription(); local != nil && local.SDP != "" {
+			p.sendSignal(protocol.RTCSignal{
+				Type:   protocol.TypeOffer,
+				SDP:    local.SDP,
+				Tracks: p.outboundTracks(),
+			})
 		}
-		p.hub.log.Warn("WebRTC 重协商超时，保留连接",
+		p.hub.log.Warn("WebRTC 重协商超时，重发当前 offer",
 			"room_id", p.room.ID, "peer_id", p.ID,
 			"retry", st.offerRetries, "retry_in", backoff.String())
 		return
@@ -1288,17 +1363,27 @@ func iceRestartDelay(attempt int) time.Duration {
 
 func (p *RTCPeer) startICERestart(now time.Time) {
 	st := &p.state
+	if p.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
+		st.restarting = true
+		st.needOffer = true
+		if !st.pendingOffer {
+			st.pendingOffer = true
+			st.offerSentAt = now
+		}
+		if local := p.pc.LocalDescription(); local != nil && local.SDP != "" {
+			p.sendSignal(protocol.RTCSignal{
+				Type:   protocol.TypeOffer,
+				SDP:    local.SDP,
+				Tracks: p.outboundTracks(),
+			})
+		}
+		st.restartAt = now
+		return
+	}
 	st.iceRestarts++
 	st.restartAt = now
 	p.hub.iceRestarts.Add(1)
 
-	if p.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
-		if err := p.pc.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
-			p.negotiationFailed("ice_restart_rollback", err)
-			return
-		}
-		st.pendingOffer = false
-	}
 	st.restarting = true
 	st.needOffer = true
 	st.retryAt = now
@@ -1626,7 +1711,7 @@ func (t *publishedTrack) requestKeyframe() {
 }
 
 func (t *publishedTrack) writeKeyframeRequest() {
-	if t.closed.Load() || t.owner.isClosed() {
+	if t.closed.Load() || t.owner == nil || t.owner.isClosed() {
 		return
 	}
 	t.rtcpMu.Lock()
@@ -1686,7 +1771,7 @@ func (t *publishedTrack) readLoop() {
 		}
 		for _, dl := range subs {
 			dl.enqueue(raw)
-			if keyframe {
+			if keyframe && dl.negotiated.Load() {
 				dl.clearKeyframeWait()
 			}
 		}

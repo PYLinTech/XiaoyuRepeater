@@ -109,8 +109,11 @@ cd web && npm install && npm run dev
 | `XR_MAX_FRAME_BYTES` | `1048576` | 单帧最大字节数（1 MiB），1KB–64MB |
 | `XR_AGENT_SUBSCRIPTION_QUEUE` | `256` | 每个使用方连接待处理的订阅命令队列长度，16–8192；队列满时直接拒绝新命令 |
 | `XR_WEBRTC_ENABLED` | `true` | 是否启用自托管 WebRTC SFU |
-| `XR_WEBRTC_UDP_PORT_MIN` / `XR_WEBRTC_UDP_PORT_MAX` | `50000` / `50100` | WebRTC UDP 端口范围，1024–65535 |
+| `XR_WEBRTC_UDP_PORT_MIN` / `XR_WEBRTC_UDP_PORT_MAX` | `50000` / `50100` | WebRTC UDP 端口范围，1024–65535（未启用 UDP Mux 时生效） |
+| `XR_WEBRTC_UDP_MUX_PORT` | `0` | 单端口 WebRTC UDP Mux 端口，1024–65535；`0` 关闭并沿用端口范围 |
+| `XR_WEBRTC_TCP_MUX_PORT` | `0` | 可选 WebRTC 被动 ICE-TCP Mux 端口，1024–65535；`0` 关闭 |
 | `XR_WEBRTC_PUBLIC_IP` | 空 | 1:1 NAT/容器对外的 IP，多个用逗号分隔；用于重写 ICE 候选 |
+| `XR_WEBRTC_ICE_SERVERS` | 空 | 可选外部 STUN/TURN URL 列表，多个用逗号分隔 |
 | `XR_WEBRTC_MAX_TRACKS_PER_PEER` | `8` | 每个 WebRTC 参与者最多发布的轨道数，1–32 |
 | `XR_WEBRTC_VIDEO_QUEUE` | `256` | 每个订阅者的视频下行包队列长度，16–8192 |
 | `XR_WEBRTC_AUDIO_QUEUE` | `200` | 每个订阅者的音频下行包队列长度，16–8192 |

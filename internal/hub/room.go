@@ -128,6 +128,12 @@ func (r *Room) peerByID(id string) *RTCPeer {
 	return r.peers[id]
 }
 
+func (r *Room) participantByID(id string) *Participant {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.participants[id]
+}
+
 func (r *Room) isFull() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

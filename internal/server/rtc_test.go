@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -833,4 +834,126 @@ func TestWebRTCDisabled(t *testing.T) {
 		t.Fatalf("disabled webrtc triggered agent event: %v", event)
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+func TestWebRTCDisconnectCommand(t *testing.T) {
+	env := newTestEnv(t, func(cfg *config.Config) {
+		cfg.WebRTCEnabled = true
+		cfg.WebRTCUDPPortMin = 54000
+		cfg.WebRTCUDPPortMax = 54099
+		cfg.WebRTCMaxTracksPerPeer = 4
+	})
+	agent, hello := newAgentHarness(t, env.ts.URL, env.secret, allowTokens("ok-"))
+	hasDisconnect := false
+	for _, f := range hello.Features {
+		if f == "disconnect_connection" {
+			hasDisconnect = true
+		}
+	}
+	if !hasDisconnect {
+		t.Fatalf("hello features missing disconnect_connection: %+v", hello.Features)
+	}
+
+	room := env.createRoom("断连测试", 2)
+	publisher := mustDialRTC(t, env.ts.URL, room.ID, "ok-alice")
+	agent.waitEvent(t, protocol.TypeAuthRequest, 5*time.Second)
+	joined := agent.waitEvent(t, protocol.TypeUserJoined, 5*time.Second)
+	connID, _ := joined["conn_id"].(string)
+	if connID == "" {
+		t.Fatalf("missing conn_id: %+v", joined)
+	}
+
+	track := opusTrack(t)
+	if _, err := publisher.pc.AddTrack(track); err != nil {
+		t.Fatalf("add track: %v", err)
+	}
+	publisher.sendOffer()
+	publisher.waitAnswer(15 * time.Second)
+	publisher.waitConnected(20 * time.Second)
+	stopWriter := writeTrackRTP(track, []byte{0x01, 0x02}, 111, 960)
+	defer close(stopWriter)
+	agent.waitEvent(t, protocol.TypeTrackPublished, 15*time.Second)
+
+	// 主动断开连接，应立即关闭该 peer 并清理其发布的轨道与名额
+	agent.sendJSON(t, protocol.DisconnectCommand{
+		Type:      protocol.TypeDisconnect,
+		RequestID: "dc-1",
+		RoomID:    room.ID,
+		ConnID:    connID,
+		Code:      4001,
+		Reason:    "replaced",
+	})
+	agent.waitEvent(t, protocol.TypeTrackUnpublished, 5*time.Second)
+	left := agent.waitEvent(t, protocol.TypeUserLeft, 5*time.Second)
+	if left["conn_id"] != connID {
+		t.Fatalf("unexpected user_left: %+v", left)
+	}
+	ack := agent.waitEvent(t, protocol.TypeDisconnected, 5*time.Second)
+	if ack["request_id"] != "dc-1" || ack["closed"] != true {
+		t.Fatalf("unexpected disconnected ack: %+v", ack)
+	}
+	publisher.waitCloseCode(4001, 5*time.Second)
+}
+
+func freePort(t *testing.T, network string) int {
+	t.Helper()
+	if network == "udp" {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+		if err != nil {
+			t.Fatalf("listen udp: %v", err)
+		}
+		port := conn.LocalAddr().(*net.UDPAddr).Port
+		_ = conn.Close()
+		return port
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+func TestWebRTCUDPMuxAndTCPMux(t *testing.T) {
+	udpPort := freePort(t, "udp")
+	tcpPort := freePort(t, "tcp")
+	env := newTestEnv(t, func(cfg *config.Config) {
+		cfg.WebRTCEnabled = true
+		cfg.WebRTCUDPMuxPort = udpPort
+		cfg.WebRTCTCPMuxPort = tcpPort
+		cfg.WebRTCMaxTracksPerPeer = 4
+	})
+	agent, _ := newAgentHarness(t, env.ts.URL, env.secret, allowTokens("ok-"))
+	room := env.createRoom("Mux 房间", 2)
+
+	publisher := mustDialRTC(t, env.ts.URL, room.ID, "ok-pub")
+	agent.waitEvent(t, protocol.TypeAuthRequest, 5*time.Second)
+	track := opusTrack(t)
+	if _, err := publisher.pc.AddTrack(track); err != nil {
+		t.Fatalf("add track: %v", err)
+	}
+	publisher.sendOffer()
+	publisher.waitAnswer(15 * time.Second)
+	publisher.waitConnected(20 * time.Second)
+
+	payload := []byte{0xca, 0xfe, 0xba, 0xbe}
+	stopWriter := writeTrackRTP(track, payload, 111, 960)
+	defer close(stopWriter)
+
+	subscriber := mustDialRTC(t, env.ts.URL, room.ID, "ok-sub")
+	agent.waitEvent(t, protocol.TypeAuthRequest, 5*time.Second)
+	if _, err := subscriber.pc.AddTransceiverFromKind(
+		webrtc.RTPCodecTypeAudio,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
+	); err != nil {
+		t.Fatalf("add recvonly transceiver: %v", err)
+	}
+	subscriber.sendOffer()
+	subscriber.waitAnswer(15 * time.Second)
+	subscriber.answerOffer(subscriber.waitOffer(15 * time.Second))
+	subscriber.waitConnected(20 * time.Second)
+
+	remote := subscriber.waitTrack(15 * time.Second)
+	subscriber.expectPayload(remote, payload, 15*time.Second)
 }
