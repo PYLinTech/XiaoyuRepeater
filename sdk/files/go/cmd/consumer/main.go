@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log"
@@ -38,6 +39,7 @@ func main() {
 
 	created, err := client.CreateRoom(ctx, xiaoyurepeater.RoomOptions{
 		Name:            *roomName,
+		Metadata:        json.RawMessage(`{"purpose":"sdk-demo"}`),
 		MaxParticipants: *maxParticipants,
 	})
 	if err != nil {

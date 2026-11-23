@@ -11,7 +11,9 @@ import (
 )
 
 const (
-	agentQueueSize    = 128
+	// 订阅确认与房间事件可能在同一轮恢复中集中到达，队列过小会把正常突发
+	// 误判为慢使用方并断开鉴权通道。
+	agentQueueSize    = 1024
 	agentPendingLimit = 256
 	agentReadLimit    = 256 << 10
 	agentReadTimeout  = 75 * time.Second
@@ -35,6 +37,7 @@ type Agent struct {
 	connected  time.Time
 	ws         *websocket.Conn
 	out        chan []byte
+	subs       chan protocol.SubscriptionsCommand
 	done       chan struct{}
 	closeOnce  sync.Once
 
@@ -52,6 +55,7 @@ func newAgent(h *Hub, ws *websocket.Conn, keyID, keyName, remoteAddr string) *Ag
 		connected:  time.Now().UTC(),
 		ws:         ws,
 		out:        make(chan []byte, agentQueueSize),
+		subs:       make(chan protocol.SubscriptionsCommand, h.cfg.AgentSubscriptionQueue),
 		done:       make(chan struct{}),
 		pending:    make(map[string]chan AuthOutcome),
 	}
@@ -148,13 +152,38 @@ func (a *Agent) readLoop() {
 				a.hub.log.Warn("解析订阅命令失败", "error", err, "agent_id", a.id)
 				continue
 			}
-			a.handleSubscriptions(cmd)
+			a.enqueueSubscriptions(cmd)
 		case protocol.TypePing:
 			a.sendJSON(protocol.Pong{Type: protocol.TypePong, Time: time.Now().UTC()})
 		case protocol.TypePong:
 		default:
 			a.hub.log.Debug("忽略未知使用方消息", "type", envelope.Type, "agent_id", a.id)
 		}
+	}
+}
+
+// subscriptionLoop keeps peer-actor waits off the reader goroutine so auth,
+// pong and ping handling stay responsive during subscription bursts.
+func (a *Agent) subscriptionLoop() {
+	for !a.isClosed() {
+		select {
+		case <-a.done:
+			return
+		case cmd := <-a.subs:
+			a.handleSubscriptions(cmd)
+		}
+	}
+}
+
+func (a *Agent) enqueueSubscriptions(cmd protocol.SubscriptionsCommand) {
+	if a.isClosed() {
+		return
+	}
+	select {
+	case a.subs <- cmd:
+	case <-a.done:
+	default:
+		a.sendCommandError(cmd, "订阅命令过多，请稍后重试")
 	}
 }
 
@@ -170,7 +199,7 @@ func (a *Agent) handleSubscriptions(cmd protocol.SubscriptionsCommand) {
 
 	a.hub.mu.RLock()
 	room := a.hub.rooms[cmd.RoomID]
-	owned := room != nil && room.KeyID == a.keyID
+	owned := room != nil && room.KeyID == a.keyID && a.hub.agents[a.keyID] == a
 	a.hub.mu.RUnlock()
 	if !owned {
 		a.sendCommandError(cmd, "房间不存在或不属于当前密钥")
@@ -186,19 +215,29 @@ func (a *Agent) handleSubscriptions(cmd protocol.SubscriptionsCommand) {
 		return
 	}
 
-	trackIDs, ok := peer.setSubscriptions(cmd.TrackIDs, cmd.All)
+	result, ok := peer.applySubscriptions(cmd.All, cmd.TrackIDs, cmd.RequestID, cmd.Revision)
 	if !ok {
-		a.sendCommandError(cmd, "WebRTC 参与者已断开")
+		a.sendCommandError(cmd, "WebRTC 参与者已断开或订阅应用超时")
 		return
 	}
+	room.touch()
 	a.sendJSON(protocol.SubscriptionsUpdate{
 		Type:      protocol.TypeSubscriptionsUpdated,
 		RequestID: cmd.RequestID,
 		RoomID:    cmd.RoomID,
 		ConnID:    cmd.ConnID,
-		TrackIDs:  trackIDs,
-		All:       cmd.All,
+		TrackIDs:  result.normalized,
+		All:       result.all,
+		Revision:  result.revision,
+		Applied:   result.applied,
+		Pending:   result.pending,
+		Duplicate: result.duplicate,
+		Stale:     result.stale,
 	})
+	if result.duplicate {
+		a.hub.log.Debug("忽略重复的订阅命令",
+			"room_id", cmd.RoomID, "peer_id", cmd.ConnID, "request_id", cmd.RequestID)
+	}
 }
 
 func (a *Agent) sendCommandError(cmd protocol.SubscriptionsCommand, message string) {
@@ -213,6 +252,12 @@ func (a *Agent) sendCommandError(cmd protocol.SubscriptionsCommand, message stri
 
 func (a *Agent) deliverAuth(resp protocol.AuthResponse) {
 	if resp.RequestID == "" {
+		return
+	}
+	a.hub.mu.RLock()
+	current := a.hub.agents[a.keyID] == a
+	a.hub.mu.RUnlock()
+	if !current {
 		return
 	}
 	a.pendingMu.Lock()

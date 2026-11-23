@@ -1,6 +1,9 @@
 package xiaoyurepeater
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	// Version is this SDK package version.
@@ -12,8 +15,9 @@ const (
 // RoomOptions controls room creation. Zero values are omitted so the relay
 // applies its configured defaults.
 type RoomOptions struct {
-	Name            string `json:"name,omitempty"`
-	MaxParticipants int    `json:"max_participants,omitempty"`
+	Name            string          `json:"name,omitempty"`
+	Metadata        json.RawMessage `json:"metadata,omitempty"`
+	MaxParticipants int             `json:"max_participants,omitempty"`
 }
 
 // VersionInfo describes the SDK package served by a relay instance.
@@ -38,21 +42,25 @@ type Participant struct {
 
 // Room is the live room state returned by the consumer API.
 type Room struct {
-	ID               string        `json:"id"`
-	Name             string        `json:"name"`
-	KeyID            string        `json:"key_id"`
-	KeyName          string        `json:"key_name"`
-	CreatedAt        time.Time     `json:"created_at"`
-	MaxParticipants  int           `json:"max_participants"`
-	ParticipantCount int           `json:"participant_count"`
-	Participants     []Participant `json:"participants"`
-	AgentOnline      bool          `json:"agent_online"`
-	RTCPeers         int           `json:"rtc_peers"`
-	Tracks           int           `json:"tracks"`
-	Messages         int64         `json:"messages"`
-	Bytes            int64         `json:"bytes"`
-	RTPPackets       int64         `json:"rtp_packets"`
-	RTPBytes         int64         `json:"rtp_bytes"`
+	ID               string          `json:"id"`
+	Name             string          `json:"name"`
+	Metadata         json.RawMessage `json:"metadata,omitempty"`
+	KeyID            string          `json:"key_id"`
+	KeyName          string          `json:"key_name"`
+	CreatedAt        time.Time       `json:"created_at"`
+	MaxParticipants  int             `json:"max_participants"`
+	ParticipantCount int             `json:"participant_count"`
+	Participants     []Participant   `json:"participants"`
+	AgentOnline      bool            `json:"agent_online"`
+	RTCPeers         int             `json:"rtc_peers"`
+	Tracks           int             `json:"tracks"`
+	Messages         int64           `json:"messages"`
+	Bytes            int64           `json:"bytes"`
+	RTCSubscriptions int             `json:"rtc_subscriptions"`
+	RTPPackets       int64           `json:"rtp_packets"`
+	RTPBytes         int64           `json:"rtp_bytes"`
+	RTPDropped       int64           `json:"rtp_dropped"`
+	LastActivity     time.Time       `json:"last_activity"`
 }
 
 // CreatedRoom is the response to room creation.
@@ -65,11 +73,23 @@ type CreatedRoom struct {
 	WebRTCURL  string `json:"webrtc_url"`
 }
 
+// SubscriptionState is the relay's stored desired subscription of one WebRTC
+// participant. Applied lists tracks currently attached to the PeerConnection;
+// TrackIDs is the desired list and may contain tracks not published yet.
+type SubscriptionState struct {
+	All       bool      `json:"all"`
+	TrackIDs  []string  `json:"track_ids"`
+	Revision  int64     `json:"revision,omitempty"`
+	Applied   []string  `json:"applied,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
 // ConnectionRef is an online connection snapshot sent in hello.
 type ConnectionRef struct {
-	ConnID    string `json:"conn_id"`
-	Transport string `json:"transport"`
-	Subject   string `json:"subject"`
+	ConnID        string             `json:"conn_id"`
+	Transport     string             `json:"transport"`
+	Subject       string             `json:"subject"`
+	Subscriptions *SubscriptionState `json:"subscriptions,omitempty"`
 }
 
 // Track is room-level track metadata. Payload bytes never pass through the
@@ -88,6 +108,7 @@ type Track struct {
 type RoomSnapshot struct {
 	ID           string          `json:"id"`
 	Name         string          `json:"name"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
 	Participants int             `json:"participants"`
 	CreatedAt    time.Time       `json:"created_at"`
 	Connections  []ConnectionRef `json:"connections,omitempty"`
@@ -115,6 +136,7 @@ type Hello struct {
 	ServerTime time.Time      `json:"server_time"`
 	Rooms      []RoomSnapshot `json:"rooms"`
 	Limits     Limits         `json:"limits"`
+	Features   []string       `json:"features,omitempty"`
 }
 
 // AuthRequest is forwarded by the relay when a user wants to join a room.
@@ -125,6 +147,7 @@ type AuthRequest struct {
 	RequestID   string              `json:"request_id"`
 	RoomID      string              `json:"room_id"`
 	RoomName    string              `json:"room_name"`
+	Metadata    json.RawMessage     `json:"metadata,omitempty"`
 	Transport   string              `json:"transport"`
 	RemoteAddr  string              `json:"remote_addr"`
 	Query       map[string][]string `json:"query"`
@@ -221,9 +244,13 @@ type SubscriptionsCommand struct {
 	ConnID    string   `json:"conn_id"`
 	TrackIDs  []string `json:"track_ids"`
 	All       bool     `json:"all"`
+	Revision  int64    `json:"revision,omitempty"`
 }
 
 // SubscriptionsUpdate is the relay's confirmation of a subscription change.
+// Applied lists tracks currently attached, Pending the desired tracks that are
+// not published or not synced yet. Duplicate and Stale mark idempotent replays
+// and commands older than the stored revision.
 type SubscriptionsUpdate struct {
 	Type      string   `json:"type"`
 	RequestID string   `json:"request_id"`
@@ -231,6 +258,11 @@ type SubscriptionsUpdate struct {
 	ConnID    string   `json:"conn_id"`
 	TrackIDs  []string `json:"track_ids"`
 	All       bool     `json:"all"`
+	Revision  int64    `json:"revision,omitempty"`
+	Applied   []string `json:"applied,omitempty"`
+	Pending   []string `json:"pending,omitempty"`
+	Duplicate bool     `json:"duplicate,omitempty"`
+	Stale     bool     `json:"stale,omitempty"`
 }
 
 // AgentError is a command error returned on the control channel.

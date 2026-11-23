@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import secrets
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -166,7 +167,7 @@ async def sdk_version(base_url: str = "") -> dict[str, Any]:
 
 
 class Client:
-    """Control-plane client for creating, listing and closing rooms."""
+    """Control-plane client for creating, reading, listing and closing rooms."""
 
     def __init__(self, api_key: str = "", base_url: str = "") -> None:
         self.api_key = api_key or os.environ.get("XR_API_KEY", "")
@@ -177,12 +178,19 @@ class Client:
     async def sdk_version(self) -> dict[str, Any]:
         return await sdk_version(self.base_url)
 
-    async def create_room(self, name: str = "", max_participants: int = 0) -> dict[str, Any]:
+    async def create_room(
+        self,
+        name: str = "",
+        max_participants: int = 0,
+        metadata: Any = None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {}
         if name:
             body["name"] = name
         if max_participants:
             body["max_participants"] = int(max_participants)
+        if metadata is not None:
+            body["metadata"] = metadata
         return await asyncio.to_thread(
             _request_sync, "POST", self.base_url, "/v1/rooms", self.api_key, body
         )
@@ -193,6 +201,17 @@ class Client:
         )
         rooms = payload.get("rooms", [])
         return rooms if isinstance(rooms, list) else []
+
+    async def get_room(self, room_id: str) -> dict[str, Any]:
+        payload = await asyncio.to_thread(
+            _request_sync,
+            "GET",
+            self.base_url,
+            f"/v1/rooms/{quote(room_id, safe='')}",
+            self.api_key,
+        )
+        room = payload.get("room", {})
+        return room if isinstance(room, dict) else {}
 
     async def close_room(self, room_id: str) -> dict[str, Any]:
         try:
@@ -233,6 +252,7 @@ class Agent:
         self._ws: Any = None
         self._hello: dict[str, Any] | None = None
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._revision = int(time.time() * 1000)
         self._tasks: set[asyncio.Task[Any]] = set()
         self._dispatch_lock = asyncio.Lock()
 
@@ -314,29 +334,40 @@ class Agent:
         """Replace one WebRTC participant's complete subscription list."""
         if not room_id or not conn_id:
             raise ValueError("room_id 与 conn_id 不能为空")
-        if not self.connected:
-            raise DisconnectedError("使用方通道未连接")
-        request_id = f"sub_{secrets.token_hex(8)}"
-        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = future
-        try:
-            await self._send(
-                {
-                    "type": "subscriptions",
-                    "request_id": request_id,
-                    "room_id": room_id,
-                    "conn_id": conn_id,
-                    "track_ids": list(track_ids or []),
-                    "all": bool(all),
-                }
-            )
-        except Exception:
-            self._pending.pop(request_id, None)
-            raise
-        try:
-            return await future
-        finally:
-            self._pending.pop(request_id, None)
+        # 服务端可能保留更高版本（例如使用方进程刚重启），陈旧命令未生效时带新版本重试一次
+        retry = True
+        while True:
+            if not self.connected:
+                raise DisconnectedError("使用方通道未连接")
+            request_id = f"sub_{secrets.token_hex(8)}"
+            future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            self._pending[request_id] = future
+            self._revision += 1
+            try:
+                await self._send(
+                    {
+                        "type": "subscriptions",
+                        "request_id": request_id,
+                        "room_id": room_id,
+                        "conn_id": conn_id,
+                        "track_ids": list(track_ids or []),
+                        "all": bool(all),
+                        "revision": self._revision,
+                    }
+                )
+            except Exception:
+                self._pending.pop(request_id, None)
+                raise
+            try:
+                update = await future
+            finally:
+                self._pending.pop(request_id, None)
+            revision = update.get("revision")
+            if isinstance(revision, int) and revision > self._revision:
+                self._revision = revision
+            if not update.get("stale") or not retry:
+                return update
+            retry = False
 
     async def _run_once(self) -> bool:
         try:

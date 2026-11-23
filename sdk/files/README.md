@@ -104,12 +104,15 @@ X-Api-Key: <API Key>
 | --- | --- | --- |
 | `GET` | `/api/sdk/version` | 查询 SDK 元数据，无需 API Key |
 | `GET` | `/api/sdk/download` | 下载 SDK 包，无需 API Key |
-| `POST` | `/v1/rooms` | 创建房间，请求体 `{ "name": "...", "max_participants": 20 }` |
+| `POST` | `/v1/rooms` | 创建房间，请求体 `{ "name": "...", "metadata": {...}, "max_participants": 20 }` |
 | `GET` | `/v1/rooms` | 列出当前密钥的房间 |
+| `GET` | `/v1/rooms/{id}` | 查询当前密钥名下的单个房间 |
 | `DELETE` | `/v1/rooms/{id}` | 关闭自己的房间；房间不存在、已关闭或不属于当前密钥时返回 404，SDK 将该情况视为成功 |
 | `GET` (WebSocket) | `/v1/agent` | 使用方控制通道 |
 
-错误响应包含 `error`，带错误码的失败还会附带 `code`：
+`metadata` 是任意 JSON，中继原样保存并回传，不解析其结构；它会出现在房间查询、`hello` 房间快照和 `auth_request` 中。使用方可借此携带租户、用途、外部 ID 等自己的上下文。
+
+所有错误响应包含 `error` 与稳定 `code`：
 
 ```json
 { "error": "错误说明", "code": "auth_denied" }
@@ -121,7 +124,7 @@ X-Api-Key: <API Key>
 
 | 类型 | 说明 |
 | --- | --- |
-| `hello` | 连接建立后的全量快照：密钥、房间、在线连接、轨道、限制 |
+| `hello` | 连接建立后的全量快照：密钥、房间、在线连接、轨道、限制与服务端能力 |
 | `auth_request` | 用户加入请求，转发用户的查询参数与请求头 |
 | `user_joined` / `user_left` | 用户加入 / 离开 |
 | `room_closed` | 房间关闭 |
@@ -148,6 +151,7 @@ X-Api-Key: <API Key>
   "request_id": "aq_xxxxxxxxx",
   "room_id": "r_xxxxxxxxx",
   "room_name": "demo",
+  "metadata": { "tenant": "acme" },
   "transport": "ws",
   "remote_addr": "203.0.113.10",
   "query": { "token": ["..."] },
@@ -196,11 +200,14 @@ X-Api-Key: <API Key>
   "room_id": "r_xxxxxxxxx",
   "conn_id": "p_xxxxxxxx",
   "track_ids": ["t_aaaaaaaa", "t_bbbbbbbb"],
-  "all": false
+  "all": false,
+  "revision": 1760000000001
 }
 ```
 
 `all: true` 表示订阅当前及未来全部轨道，此时忽略 `track_ids`；空数组表示不订阅任何轨道。未发送过订阅命令的参与者默认订阅全部轨道。订阅只决定该参与者接收哪些轨道（不会收到自己发布的轨道）；首次协商完成前设置的订阅会在协商完成后生效。SDK 会等待 `subscriptions_updated` 或 `error` 后返回；等待期间通道断开则返回断开错误。
+
+`revision` 由 SDK 自动维护为单调递增整数，并在每次确认后吸收服务端版本。确认消息包含 `applied`（当前已挂载轨道）、`pending`（尚未发布或尚未同步的轨道）、`duplicate`（重复命令被幂等吸收）与 `stale`（命令版本低于服务端已保存版本、未生效）；SDK 遇到 `stale` 会带新版本自动重试一次。`hello.features` 标记服务端能力，当前为 `subscription_ack`、`subscription_snapshot` 与 `room_metadata`；`hello.rooms[].connections[].subscriptions` 是服务端保存的目标订阅状态，使用方重连后应据此对账。
 
 ## 重连与关闭码
 

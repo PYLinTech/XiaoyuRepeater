@@ -174,16 +174,22 @@ export class Client {
     return readResponse(response);
   }
 
-  createRoom({ name = "", maxParticipants = 0 } = {}) {
+  createRoom({ name = "", maxParticipants = 0, metadata } = {}) {
     const body = {};
     if (name) body.name = name;
     if (maxParticipants) body.max_participants = maxParticipants;
+    if (metadata !== undefined) body.metadata = metadata;
     return this.request("POST", "/v1/rooms", body);
   }
 
   async listRooms() {
     const data = await this.request("GET", "/v1/rooms");
     return data.rooms || [];
+  }
+
+  async getRoom(roomId) {
+    const data = await this.request("GET", `/v1/rooms/${encodeURIComponent(roomId)}`);
+    return data.room;
   }
 
   async closeRoom(roomId) {
@@ -221,6 +227,7 @@ export class Agent {
   #hello = null;
   #pending = new Map();
   #eventChain = Promise.resolve();
+  #revision = Date.now();
 
   constructor(client, handler = {}) {
     this.#client = client;
@@ -277,29 +284,38 @@ export class Agent {
     }
   }
 
-  subscribe(roomId, connId, { trackIds = [], all = false } = {}) {
+  async subscribe(roomId, connId, { trackIds = [], all = false } = {}) {
     if (!roomId || !connId) {
-      return Promise.reject(new Error("roomId 与 connId 不能为空"));
+      throw new Error("roomId 与 connId 不能为空");
     }
-    const ws = this.#ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new DisconnectedError("使用方通道未连接"));
-    }
-    const requestId = `sub_${randomUUID()}`;
-    return new Promise((resolve, reject) => {
-      this.#pending.set(requestId, { resolve, reject });
-      this.#send({
-        type: "subscriptions",
-        request_id: requestId,
-        room_id: roomId,
-        conn_id: connId,
-        track_ids: Array.isArray(trackIds) ? trackIds : [],
-        all: Boolean(all),
-      }).catch((error) => {
-        this.#pending.delete(requestId);
-        reject(error);
+    // 服务端可能保留更高版本（例如使用方进程刚重启），陈旧命令未生效时带新版本重试一次
+    for (let attempt = 0; ; attempt += 1) {
+      const ws = this.#ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        throw new DisconnectedError("使用方通道未连接");
+      }
+      const requestId = `sub_${randomUUID()}`;
+      const update = await new Promise((resolve, reject) => {
+        this.#pending.set(requestId, { resolve, reject });
+        this.#send({
+          type: "subscriptions",
+          request_id: requestId,
+          room_id: roomId,
+          conn_id: connId,
+          track_ids: Array.isArray(trackIds) ? trackIds : [],
+          all: Boolean(all),
+          revision: ++this.#revision,
+        }).catch((error) => {
+          this.#pending.delete(requestId);
+          reject(error);
+        });
       });
-    });
+      const revision = Number(update.revision);
+      if (Number.isFinite(revision) && revision > this.#revision) {
+        this.#revision = revision;
+      }
+      if (!update.stale || attempt > 0) return update;
+    }
   }
 
   async #runOnce() {

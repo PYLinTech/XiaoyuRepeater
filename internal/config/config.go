@@ -21,6 +21,7 @@ type Config struct {
 	TrustProxy             bool
 	AuthTimeout            time.Duration
 	SessionTTL             time.Duration
+	AgentSubscriptionQueue int
 	MaxRoomsPerKey         int
 	DefaultMaxParticipants int
 	MaxParticipantsCap     int
@@ -30,6 +31,14 @@ type Config struct {
 	WebRTCUDPPortMax       int
 	WebRTCPublicIPs        []string
 	WebRTCMaxTracksPerPeer int
+	WebRTCVideoQueue       int
+	WebRTCAudioQueue       int
+	WebRTCConnectTimeout   time.Duration
+	WebRTCPendingICELimit  int
+	WebRTCDesiredTTL       time.Duration
+	WebRTCMaxDesiredTracks int
+	RoomSweepInterval      time.Duration
+	RoomOrphanTTL          time.Duration
 	LogLevel               slog.Level
 }
 
@@ -43,6 +52,7 @@ func Load() (Config, error) {
 		TrustProxy:             envBool("XR_TRUST_PROXY", false),
 		AuthTimeout:            envDuration("XR_AUTH_TIMEOUT", 10*time.Second),
 		SessionTTL:             envDuration("XR_SESSION_TTL", 12*time.Hour),
+		AgentSubscriptionQueue: envInt("XR_AGENT_SUBSCRIPTION_QUEUE", 256),
 		MaxRoomsPerKey:         envInt("XR_MAX_ROOMS_PER_KEY", 100),
 		DefaultMaxParticipants: envInt("XR_DEFAULT_MAX_PARTICIPANTS", 50),
 		MaxParticipantsCap:     envInt("XR_MAX_PARTICIPANTS", 500),
@@ -52,6 +62,14 @@ func Load() (Config, error) {
 		WebRTCUDPPortMax:       envInt("XR_WEBRTC_UDP_PORT_MAX", 50100),
 		WebRTCPublicIPs:        envList("XR_WEBRTC_PUBLIC_IP"),
 		WebRTCMaxTracksPerPeer: envInt("XR_WEBRTC_MAX_TRACKS_PER_PEER", 8),
+		WebRTCVideoQueue:       envInt("XR_WEBRTC_VIDEO_QUEUE", 256),
+		WebRTCAudioQueue:       envInt("XR_WEBRTC_AUDIO_QUEUE", 200),
+		WebRTCConnectTimeout:   envDuration("XR_WEBRTC_CONNECT_TIMEOUT", 45*time.Second),
+		WebRTCPendingICELimit:  envInt("XR_WEBRTC_PENDING_ICE_LIMIT", 64),
+		WebRTCDesiredTTL:       envDuration("XR_WEBRTC_DESIRED_TTL", 5*time.Minute),
+		WebRTCMaxDesiredTracks: envInt("XR_WEBRTC_MAX_DESIRED_TRACKS", 512),
+		RoomSweepInterval:      envDuration("XR_ROOM_SWEEP_INTERVAL", 15*time.Second),
+		RoomOrphanTTL:          envDuration("XR_ROOM_ORPHAN_TTL", 30*time.Minute),
 		LogLevel:               slog.LevelInfo,
 	}
 
@@ -79,6 +97,9 @@ func Load() (Config, error) {
 	if cfg.SessionTTL < time.Minute || cfg.SessionTTL > 30*24*time.Hour {
 		return cfg, fmt.Errorf("XR_SESSION_TTL 需要在 1m 到 720h 之间")
 	}
+	if cfg.AgentSubscriptionQueue < 16 || cfg.AgentSubscriptionQueue > 8192 {
+		return cfg, fmt.Errorf("XR_AGENT_SUBSCRIPTION_QUEUE 需要在 16 到 8192 之间")
+	}
 	if cfg.MaxRoomsPerKey < 1 || cfg.MaxRoomsPerKey > 10000 {
 		return cfg, fmt.Errorf("XR_MAX_ROOMS_PER_KEY 需要在 1 到 10000 之间")
 	}
@@ -105,6 +126,32 @@ func Load() (Config, error) {
 	}
 	if cfg.WebRTCMaxTracksPerPeer < 1 || cfg.WebRTCMaxTracksPerPeer > 32 {
 		return cfg, fmt.Errorf("XR_WEBRTC_MAX_TRACKS_PER_PEER 需要在 1 到 32 之间")
+	}
+	if cfg.WebRTCVideoQueue < 16 || cfg.WebRTCVideoQueue > 8192 {
+		return cfg, fmt.Errorf("XR_WEBRTC_VIDEO_QUEUE 需要在 16 到 8192 之间")
+	}
+	if cfg.WebRTCAudioQueue < 16 || cfg.WebRTCAudioQueue > 8192 {
+		return cfg, fmt.Errorf("XR_WEBRTC_AUDIO_QUEUE 需要在 16 到 8192 之间")
+	}
+	if cfg.WebRTCConnectTimeout < 0 || cfg.WebRTCConnectTimeout > time.Hour ||
+		(cfg.WebRTCConnectTimeout > 0 && cfg.WebRTCConnectTimeout < 5*time.Second) {
+		return cfg, fmt.Errorf("XR_WEBRTC_CONNECT_TIMEOUT 需要为 0（关闭）或 5s 到 1h 之间")
+	}
+	if cfg.WebRTCPendingICELimit < 0 || cfg.WebRTCPendingICELimit > 4096 ||
+		(cfg.WebRTCPendingICELimit > 0 && cfg.WebRTCPendingICELimit < 8) {
+		return cfg, fmt.Errorf("XR_WEBRTC_PENDING_ICE_LIMIT 需要为 0（不限制）或 8 到 4096 之间")
+	}
+	if cfg.WebRTCDesiredTTL < time.Second || cfg.WebRTCDesiredTTL > 24*time.Hour {
+		return cfg, fmt.Errorf("XR_WEBRTC_DESIRED_TTL 需要在 1s 到 24h 之间")
+	}
+	if cfg.WebRTCMaxDesiredTracks < 8 || cfg.WebRTCMaxDesiredTracks > 8192 {
+		return cfg, fmt.Errorf("XR_WEBRTC_MAX_DESIRED_TRACKS 需要在 8 到 8192 之间")
+	}
+	if cfg.RoomSweepInterval < time.Second || cfg.RoomSweepInterval > time.Minute {
+		return cfg, fmt.Errorf("XR_ROOM_SWEEP_INTERVAL 需要在 1s 到 1m 之间")
+	}
+	if cfg.RoomOrphanTTL < time.Minute || cfg.RoomOrphanTTL > 24*time.Hour {
+		return cfg, fmt.Errorf("XR_ROOM_ORPHAN_TTL 需要在 1m 到 24h 之间")
 	}
 	return cfg, nil
 }

@@ -106,21 +106,23 @@ type Agent struct {
 	client  *Client
 	handler AgentHandler
 
-	mu       sync.Mutex
-	conn     *agentConn
-	hello    Hello
-	hasHello bool
-	pending  map[string]chan commandResult
-	cancel   context.CancelFunc
-	running  bool
+	mu          sync.Mutex
+	conn        *agentConn
+	hello       Hello
+	hasHello    bool
+	pending     map[string]chan commandResult
+	subRevision int64
+	cancel      context.CancelFunc
+	running     bool
 }
 
 // NewAgent creates an agent. Call Run to connect and keep it alive.
 func (c *Client) NewAgent(handler AgentHandler) *Agent {
 	return &Agent{
-		client:  c,
-		handler: handler,
-		pending: make(map[string]chan commandResult),
+		client:      c,
+		handler:     handler,
+		pending:     make(map[string]chan commandResult),
+		subRevision: time.Now().UnixMilli(),
 	}
 }
 
@@ -220,46 +222,54 @@ func (a *Agent) SetSubscriptions(ctx context.Context, roomID, connID string, tra
 	if roomID == "" || connID == "" {
 		return SubscriptionsUpdate{}, errors.New("roomID 与 connID 不能为空")
 	}
-	requestID := newSubscriptionRequestID()
-	result := make(chan commandResult, 1)
-
-	a.mu.Lock()
-	ac := a.conn
-	if ac == nil || ac.isClosed() {
-		a.mu.Unlock()
-		return SubscriptionsUpdate{}, ErrNotConnected
-	}
-	a.pending[requestID] = result
-	a.mu.Unlock()
-
 	if trackIDs == nil {
 		trackIDs = []string{}
 	}
-	command := SubscriptionsCommand{
-		Type:      "subscriptions",
-		RequestID: requestID,
-		RoomID:    roomID,
-		ConnID:    connID,
-		TrackIDs:  trackIDs,
-		All:       all,
-	}
-	if err := ac.writeJSON(command); err != nil {
-		a.removePending(requestID)
-		return SubscriptionsUpdate{}, err
-	}
+	// 服务端可能保留更高版本（例如使用方进程刚重启），陈旧命令未生效时带新版本重试一次
+	for attempt := 0; ; attempt++ {
+		requestID := newSubscriptionRequestID()
+		result := make(chan commandResult, 1)
 
-	select {
-	case outcome := <-result:
-		if outcome.err != nil {
-			return SubscriptionsUpdate{}, outcome.err
+		a.mu.Lock()
+		ac := a.conn
+		if ac == nil || ac.isClosed() {
+			a.mu.Unlock()
+			return SubscriptionsUpdate{}, ErrNotConnected
 		}
-		return outcome.update, nil
-	case <-ctx.Done():
-		a.removePending(requestID)
-		return SubscriptionsUpdate{}, ctx.Err()
-	case <-ac.done:
-		a.removePending(requestID)
-		return SubscriptionsUpdate{}, ErrDisconnected
+		a.subRevision++
+		command := SubscriptionsCommand{
+			Type:      "subscriptions",
+			RequestID: requestID,
+			RoomID:    roomID,
+			ConnID:    connID,
+			TrackIDs:  trackIDs,
+			All:       all,
+			Revision:  a.subRevision,
+		}
+		a.pending[requestID] = result
+		a.mu.Unlock()
+
+		if err := ac.writeJSON(command); err != nil {
+			a.removePending(requestID)
+			return SubscriptionsUpdate{}, err
+		}
+
+		select {
+		case outcome := <-result:
+			if outcome.err != nil {
+				return SubscriptionsUpdate{}, outcome.err
+			}
+			if outcome.update.Stale && attempt == 0 {
+				continue
+			}
+			return outcome.update, nil
+		case <-ctx.Done():
+			a.removePending(requestID)
+			return SubscriptionsUpdate{}, ctx.Err()
+		case <-ac.done:
+			a.removePending(requestID)
+			return SubscriptionsUpdate{}, ErrDisconnected
+		}
 	}
 }
 
@@ -501,6 +511,9 @@ func (a *Agent) runEvents(ctx context.Context, ac *agentConn) {
 
 func (a *Agent) resolveSubscription(event SubscriptionsUpdate) {
 	a.mu.Lock()
+	if event.Revision > a.subRevision {
+		a.subRevision = event.Revision
+	}
 	result := a.pending[event.RequestID]
 	if result != nil {
 		delete(a.pending, event.RequestID)

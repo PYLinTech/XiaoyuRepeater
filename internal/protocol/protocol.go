@@ -1,6 +1,9 @@
 package protocol
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const Version = 1
 
@@ -36,6 +39,7 @@ const (
 type RoomRef struct {
 	ID           string          `json:"id"`
 	Name         string          `json:"name"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
 	Participants int             `json:"participants"` // 兼容字段，等于 Connections 数量
 	CreatedAt    time.Time       `json:"created_at"`
 	Connections  []ConnectionRef `json:"connections,omitempty"`
@@ -45,10 +49,24 @@ type RoomRef struct {
 // ConnectionRef is the neutral per-connection snapshot sent to the owning
 // consumer after reconnect. It lets the consumer address existing WebRTC
 // participants for subscription commands without exposing any payload.
+// Subscriptions is the relay's stored desired state so a reconnecting
+// consumer can reconcile without replaying every historical command.
 type ConnectionRef struct {
-	ConnID    string `json:"conn_id"`
-	Transport string `json:"transport"`
-	Subject   string `json:"subject"`
+	ConnID        string             `json:"conn_id"`
+	Transport     string             `json:"transport"`
+	Subject       string             `json:"subject"`
+	Subscriptions *SubscriptionState `json:"subscriptions,omitempty"`
+}
+
+// SubscriptionState is the desired subscription of one WebRTC participant.
+// Applied lists tracks currently attached to the PeerConnection; TrackIDs is
+// the desired list and may contain tracks that are not published yet.
+type SubscriptionState struct {
+	All       bool      `json:"all"`
+	TrackIDs  []string  `json:"track_ids"`
+	Revision  int64     `json:"revision,omitempty"`
+	Applied   []string  `json:"applied,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 type Hello struct {
@@ -60,6 +78,7 @@ type Hello struct {
 	ServerTime time.Time `json:"server_time"`
 	Rooms      []RoomRef `json:"rooms"`
 	Limits     Limits    `json:"limits"`
+	Features   []string  `json:"features,omitempty"`
 }
 
 type Limits struct {
@@ -76,6 +95,7 @@ type AuthRequest struct {
 	RequestID   string              `json:"request_id"`
 	RoomID      string              `json:"room_id"`
 	RoomName    string              `json:"room_name"`
+	Metadata    json.RawMessage     `json:"metadata,omitempty"`
 	Transport   string              `json:"transport"`
 	RemoteAddr  string              `json:"remote_addr"`
 	Query       map[string][]string `json:"query"`
@@ -189,6 +209,8 @@ type TrackUnpublished struct {
 // subscription state of one WebRTC participant. If All is true, the relay
 // forwards every current and future room track and ignores TrackIDs.
 // Otherwise only the listed track IDs are forwarded; an empty list means none.
+// Revision is optional; when present it must increase for newer commands so
+// the relay can drop stale replays after a reconnect.
 type SubscriptionsCommand struct {
 	Type      string   `json:"type"`
 	RequestID string   `json:"request_id"`
@@ -196,8 +218,12 @@ type SubscriptionsCommand struct {
 	ConnID    string   `json:"conn_id"`
 	TrackIDs  []string `json:"track_ids"`
 	All       bool     `json:"all"`
+	Revision  int64    `json:"revision,omitempty"`
 }
 
+// SubscriptionsUpdate acknowledges a subscriptions command. Applied is the
+// set of tracks currently attached, Pending the desired tracks that are not
+// published or not synced yet. Duplicate/Stale mark idempotent replays.
 type SubscriptionsUpdate struct {
 	Type      string   `json:"type"`
 	RequestID string   `json:"request_id"`
@@ -205,6 +231,11 @@ type SubscriptionsUpdate struct {
 	ConnID    string   `json:"conn_id"`
 	TrackIDs  []string `json:"track_ids"`
 	All       bool     `json:"all"`
+	Revision  int64    `json:"revision,omitempty"`
+	Applied   []string `json:"applied,omitempty"`
+	Pending   []string `json:"pending,omitempty"`
+	Duplicate bool     `json:"duplicate,omitempty"`
+	Stale     bool     `json:"stale,omitempty"`
 }
 
 type AgentError struct {

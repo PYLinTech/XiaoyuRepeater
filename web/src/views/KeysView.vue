@@ -195,7 +195,7 @@ async function deleteKey() {
             class="input"
             type="text"
             maxlength="40"
-            placeholder="例如：会议分发、远程协助"
+            placeholder="例如：直播分发、远程协助"
             autocomplete="off"
           />
           <p class="field-hint">用于区分不同的使用方程序，之后可以随时删除。</p>

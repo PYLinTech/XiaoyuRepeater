@@ -28,8 +28,13 @@ from xiaoyurepeater_sdk_v1 import Client, with_query
 
 async def main() -> None:
     client = Client()  # 参数：api_key、base_url
-    created = await client.create_room(name="demo", max_participants=20)
+    created = await client.create_room(
+        name="demo",
+        max_participants=20,
+        metadata={"tenant": "acme"},
+    )
     room = created["room"]
+    current = await client.get_room(room["id"])
 
     print(with_query(created["ws_url"], {"token": "短期令牌", "name": "Alice"}))
 
@@ -94,8 +99,9 @@ python consumer.py --name "demo room"
 | --- | --- |
 | `Client(api_key="", base_url="")` | API Key 为显式参数 > `XR_API_KEY`（均缺失时报错）；服务地址为显式参数 > `XR_SERVER` > SDK 根目录 `config.json` |
 | `await client.sdk_version()` | 查询 SDK 元数据 |
-| `await client.create_room(name="", max_participants=0)` | 创建房间 |
+| `await client.create_room(name="", max_participants=0, metadata=None)` | 创建房间；`metadata` 为任意 JSON，中继原样保存 |
 | `await client.list_rooms()` | 列出房间 |
+| `await client.get_room(room_id)` | 查询单个房间 |
 | `await client.close_room(room_id)` | 关闭房间；404 视为成功 |
 | `client.agent_url()` | 使用方通道地址 |
 | `client.create_agent(handler)` | 创建使用方通道 |
@@ -125,7 +131,7 @@ python consumer.py --name "demo room"
 
 事件回调由同一把异步锁串行执行；`authorize` 并发执行。回调中可以直接 `await agent.subscribe(...)`。
 
-`subscribe` 会等待 `subscriptions_updated` 或 `error`；等待期间通道断开时抛出 `DisconnectedError`。`all=True` 表示全部当前及未来轨道；空列表表示不订阅任何轨道。
+`subscribe` 会等待 `subscriptions_updated` 或 `error`；等待期间通道断开时抛出 `DisconnectedError`。`all=True` 表示全部当前及未来轨道；空列表表示不订阅任何轨道。SDK 自动维护单调 `revision`，确认中的 `applied`/`pending` 反映实际生效状态；遇到 `stale` 会带新版本自动重试一次。
 
 ## 重连与错误
 

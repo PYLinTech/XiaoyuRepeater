@@ -141,7 +141,7 @@ async function submit() {
           <span class="foot-version">v{{ authState.version || '0.2.0' }}</span>
         </div>
       </div>
-      <p class="login-note">会议分发 · 远程协助 · 实时双向转发</p>
+      <p class="login-note">音视频房间 · 远程协助 · 实时双向转发</p>
     </div>
   </div>
 </template>

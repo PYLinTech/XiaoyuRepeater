@@ -56,12 +56,21 @@ func New(cfg config.Config, st *store.Store, logger *slog.Logger) (*Server, erro
 		MaxParticipantsCap:     cfg.MaxParticipantsCap,
 		MaxFrameBytes:          cfg.MaxFrameBytes,
 		AuthTimeout:            cfg.AuthTimeout,
+		AgentSubscriptionQueue: cfg.AgentSubscriptionQueue,
+		RoomSweepInterval:      cfg.RoomSweepInterval,
+		RoomOrphanTTL:          cfg.RoomOrphanTTL,
 		WebRTC: hub.WebRTCConfig{
-			Enabled:          cfg.WebRTCEnabled,
-			UDPPortMin:       cfg.WebRTCUDPPortMin,
-			UDPPortMax:       cfg.WebRTCUDPPortMax,
-			PublicIPs:        cfg.WebRTCPublicIPs,
-			MaxTracksPerPeer: cfg.WebRTCMaxTracksPerPeer,
+			Enabled:           cfg.WebRTCEnabled,
+			UDPPortMin:        cfg.WebRTCUDPPortMin,
+			UDPPortMax:        cfg.WebRTCUDPPortMax,
+			PublicIPs:         cfg.WebRTCPublicIPs,
+			MaxTracksPerPeer:  cfg.WebRTCMaxTracksPerPeer,
+			VideoQueuePackets: cfg.WebRTCVideoQueue,
+			AudioQueuePackets: cfg.WebRTCAudioQueue,
+			ConnectTimeout:    cfg.WebRTCConnectTimeout,
+			PendingICELimit:   cfg.WebRTCPendingICELimit,
+			MaxDesiredTracks:  cfg.WebRTCMaxDesiredTracks,
+			DesiredTTL:        cfg.WebRTCDesiredTTL,
 		},
 	}, logger)
 	if err != nil {
@@ -100,6 +109,7 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("POST /v1/rooms", s.handleConsumerCreateRoom)
 	s.mux.HandleFunc("GET /v1/rooms", s.handleConsumerListRooms)
+	s.mux.HandleFunc("GET /v1/rooms/{id}", s.handleConsumerGetRoom)
 	s.mux.HandleFunc("DELETE /v1/rooms/{id}", s.handleConsumerCloseRoom)
 	s.mux.HandleFunc("GET /v1/rooms/{id}/ws", s.handleUserWS)
 	s.mux.HandleFunc("GET /v1/rooms/{id}/webrtc", s.handleUserWebRTC)

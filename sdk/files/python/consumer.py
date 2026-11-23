@@ -45,6 +45,7 @@ async def main() -> int:
     created = await client.create_room(
         name=args.name,
         max_participants=args.max if args.max > 0 else 0,
+        metadata={"purpose": "sdk-demo"},
     )
     room = created["room"]
     join_params = {"token": args.token, "name": "demo-user"}

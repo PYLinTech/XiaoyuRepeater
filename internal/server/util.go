@@ -29,11 +29,51 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]any{"error": message})
+	writeErrorCode(w, status, defaultErrorCode(status), message)
+}
+
+func writeErrorCode(w http.ResponseWriter, status int, code, message string) {
+	if code == "" {
+		code = defaultErrorCode(status)
+	}
+	writeJSON(w, status, map[string]any{"error": message, "code": code})
 }
 
 func writeHubError(w http.ResponseWriter, err *hub.Error) {
-	writeJSON(w, err.Status, map[string]any{"error": err.Message, "code": err.Code})
+	writeErrorCode(w, err.Status, err.Code, err.Message)
+}
+
+func defaultErrorCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request"
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusMethodNotAllowed:
+		return "method_not_allowed"
+	case http.StatusConflict:
+		return "conflict"
+	case http.StatusGone:
+		return "gone"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "too_many_requests"
+	case 499:
+		return "client_canceled"
+	case http.StatusInternalServerError:
+		return "internal_error"
+	case http.StatusServiceUnavailable:
+		return "service_unavailable"
+	case http.StatusGatewayTimeout:
+		return "timeout"
+	default:
+		return "request_failed"
+	}
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {

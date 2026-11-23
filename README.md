@@ -4,9 +4,15 @@
 
 数据面提供两条可并行的通道：WebSocket 文本/二进制帧原样转发，以及可选的 WebRTC SFU 轨道转发。中继不解析业务内容、不落盘、不转码，也没有任何业务内容规则。内置 Go 服务端与 Vue 控制台，单个二进制即可部署。
 
+## 业务无关边界
+
+中继只认识 API 密钥、房间、房间级不透明 `metadata`、连接、轨道和订阅列表，不理解会议、用户、摄像头、主持人、权限或画面布局等业务概念。是否允许加入、订阅哪些轨道、如何命名 `subject`，全部由使用方在鉴权回调与订阅命令中决定；中继把 `subject` 与 `metadata` 当作不透明标签，只执行显式订阅列表或 `all=true`。
+
+因此 XiaoyuRepeater 可独立于任何会议系统部署和升级：会议、直播、远程协助等产品都只是它的使用方。会议相关的用户体系、媒体策略与状态机位于使用方自己的服务中，不进入中继代码。
+
 ## 适用场景
 
-- 会议流分发、直播旁路分发
+- 音视频房间、直播与屏幕分发
 - 远程协助 / 远程控制信令与画面转发
 - 其他需要“房间 + 使用方实时鉴权 + 透明转发”的实时应用
 
@@ -67,7 +73,7 @@ npx wscat -c 'ws://127.0.0.1:8080/v1/rooms/<房间ID>/ws?token=demo-token&name=B
 
 ### SDK 包
 
-控制台「SDK 下载」页提供使用方客户端包，内含 Go、Node.js、Python 与 curl 示例。包只覆盖控制面：房间管理、使用方通道、鉴权回调、事件与轨道订阅；不包含用户数据或媒体转发逻辑。
+控制台「SDK 下载」页提供使用方客户端包，内含 Go、Node.js、Python 与 curl 示例。包只覆盖控制面：房间创建/查询/关闭、房间级不透明 `metadata`、使用方通道、鉴权回调、事件与轨道订阅；不包含用户数据或媒体转发逻辑。
 
 - 下载地址：`GET /api/sdk/download`，文件名为 `XiaoyuRepeater_SDK_v1.zip`
 - 版本信息：`GET /api/sdk/version`，无需 API Key
@@ -101,10 +107,19 @@ cd web && npm install && npm run dev
 | `XR_DEFAULT_MAX_PARTICIPANTS` | `50` | 创建房间未指定人数上限时的默认值 |
 | `XR_MAX_PARTICIPANTS` | `500` | 房间人数上限的最大值 |
 | `XR_MAX_FRAME_BYTES` | `1048576` | 单帧最大字节数（1 MiB），1KB–64MB |
+| `XR_AGENT_SUBSCRIPTION_QUEUE` | `256` | 每个使用方连接待处理的订阅命令队列长度，16–8192；队列满时直接拒绝新命令 |
 | `XR_WEBRTC_ENABLED` | `true` | 是否启用自托管 WebRTC SFU |
 | `XR_WEBRTC_UDP_PORT_MIN` / `XR_WEBRTC_UDP_PORT_MAX` | `50000` / `50100` | WebRTC UDP 端口范围，1024–65535 |
 | `XR_WEBRTC_PUBLIC_IP` | 空 | 1:1 NAT/容器对外的 IP，多个用逗号分隔；用于重写 ICE 候选 |
 | `XR_WEBRTC_MAX_TRACKS_PER_PEER` | `8` | 每个 WebRTC 参与者最多发布的轨道数，1–32 |
+| `XR_WEBRTC_VIDEO_QUEUE` | `256` | 每个订阅者的视频下行包队列长度，16–8192 |
+| `XR_WEBRTC_AUDIO_QUEUE` | `200` | 每个订阅者的音频下行包队列长度，16–8192 |
+| `XR_WEBRTC_DESIRED_TTL` | `5m` | 订阅列表中迟迟未出现的轨道 ID 的保留时长，1s–24h |
+| `XR_WEBRTC_MAX_DESIRED_TRACKS` | `512` | 单次订阅命令接受的最大轨道 ID 数，8–8192 |
+| `XR_WEBRTC_CONNECT_TIMEOUT` | `45s` | 媒体连接首次建立超时，超时回收；`0` 关闭超时（适合预连接等长等待场景），其余取值 5s–1h |
+| `XR_WEBRTC_PENDING_ICE_LIMIT` | `64` | 远端描述就绪前缓存的 ICE 候选上限；`0` 表示不限制，其余取值 8–4096 |
+| `XR_ROOM_SWEEP_INTERVAL` | `15s` | 房间回收扫描周期，1s–1m |
+| `XR_ROOM_ORPHAN_TTL` | `30m` | 使用方持续离线多久后回收其房间，1m–24h |
 | `XR_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
 ## HTTP / WebSocket 接口
@@ -113,8 +128,9 @@ cd web && npm install && npm run dev
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/v1/rooms` | 创建房间，返回 `ws_path` / `ws_url` |
+| `POST` | `/v1/rooms` | 创建房间，可携带不透明 `metadata`，返回 `ws_path` / `ws_url` |
 | `GET` | `/v1/rooms` | 列出当前密钥名下的房间 |
+| `GET` | `/v1/rooms/{id}` | 查询自己名下的单个房间 |
 | `DELETE` | `/v1/rooms/{id}` | 关闭自己的房间 |
 | `WS` | `/v1/agent` | 使用方鉴权通道（每个密钥同时一个连接） |
 | `WS` | `/v1/rooms/{id}/ws` | 用户加入房间（WebSocket 帧通道） |
@@ -123,7 +139,9 @@ cd web && npm install && npm run dev
 | `GET` | `/api/sdk/download` | 下载 SDK 包（公开） |
 | `GET` | `/healthz` | 健康检查 |
 
-管理接口位于 `/api/admin/*`，使用 HttpOnly 会话 Cookie；完整的控制协议、鉴权消息、错误码与转发语义见 [docs/protocol.md](docs/protocol.md)。
+管理接口位于 `/api/admin/*`，使用 HttpOnly 会话 Cookie。所有 HTTP 错误响应都带稳定 `code`，响应头带 `X-Request-Id`；完整的控制协议、鉴权消息、错误码与转发语义见 [docs/protocol.md](docs/protocol.md)。
+
+房间创建时可携带任意 JSON `metadata`。中继只保存、回传，并原样放入 `hello` 房间快照与 `auth_request`，不解析其结构，也不会据此改变鉴权或转发行为。使用方可借此携带租户、用途、外部 ID 等自己的上下文。
 
 ## 转发语义
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -31,13 +32,13 @@ func (s *Server) requireConsumer(w http.ResponseWriter, r *http.Request) (store.
 	}
 	if secret == "" {
 		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeError(w, http.StatusUnauthorized, "缺少 API Key")
+		writeErrorCode(w, http.StatusUnauthorized, "missing_api_key", "缺少 API Key")
 		return store.APIKey{}, false
 	}
 	key, ok := s.store.LookupKey(secret)
 	if !ok {
 		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeError(w, http.StatusUnauthorized, "API Key 无效")
+		writeErrorCode(w, http.StatusUnauthorized, "invalid_api_key", "API Key 无效")
 		return store.APIKey{}, false
 	}
 	return key, true
@@ -49,21 +50,26 @@ func (s *Server) handleConsumerCreateRoom(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var input struct {
-		Name            string `json:"name"`
-		MaxParticipants int    `json:"max_participants"`
+		Name            string          `json:"name"`
+		Metadata        json.RawMessage `json:"metadata"`
+		MaxParticipants int             `json:"max_participants"`
 	}
 	if err := decodeJSON(w, r, &input, maxConsumerBody); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeErrorCode(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 
 	s.keyMu.Lock()
 	if _, stillExists := s.store.GetKey(key.ID); !stillExists {
 		s.keyMu.Unlock()
-		writeError(w, http.StatusUnauthorized, "API Key 已被撤销")
+		writeErrorCode(w, http.StatusUnauthorized, "api_key_revoked", "API Key 已被撤销")
 		return
 	}
-	room, hubErr := s.hub.CreateRoom(key.ID, key.Name, input.Name, input.MaxParticipants)
+	room, hubErr := s.hub.CreateRoom(key.ID, key.Name, hub.RoomOptions{
+		Name:            input.Name,
+		Metadata:        input.Metadata,
+		MaxParticipants: input.MaxParticipants,
+	})
 	s.keyMu.Unlock()
 	if hubErr != nil {
 		writeHubError(w, hubErr)
@@ -97,6 +103,19 @@ func (s *Server) handleConsumerListRooms(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"rooms": s.hub.RoomsForKey(key.ID)})
 }
 
+func (s *Server) handleConsumerGetRoom(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.requireConsumer(w, r)
+	if !ok {
+		return
+	}
+	room, found := s.hub.GetRoom(r.PathValue("id"))
+	if !found || room.KeyID != key.ID {
+		writeErrorCode(w, http.StatusNotFound, "room_not_found", "房间不存在或已关闭")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"room": room})
+}
+
 func (s *Server) handleConsumerCloseRoom(w http.ResponseWriter, r *http.Request) {
 	key, ok := s.requireConsumer(w, r)
 	if !ok {
@@ -106,19 +125,19 @@ func (s *Server) handleConsumerCloseRoom(w http.ResponseWriter, r *http.Request)
 	s.keyMu.Lock()
 	if _, stillExists := s.store.GetKey(key.ID); !stillExists {
 		s.keyMu.Unlock()
-		writeError(w, http.StatusUnauthorized, "API Key 已被撤销")
+		writeErrorCode(w, http.StatusUnauthorized, "api_key_revoked", "API Key 已被撤销")
 		return
 	}
 	room, found := s.hub.GetRoom(id)
 	if !found || room.KeyID != key.ID {
 		s.keyMu.Unlock()
-		writeError(w, http.StatusNotFound, "房间不存在或已关闭")
+		writeErrorCode(w, http.StatusNotFound, "room_not_found", "房间不存在或已关闭")
 		return
 	}
 	closed := s.hub.CloseRoom(id, "closed_by_consumer")
 	s.keyMu.Unlock()
 	if !closed {
-		writeError(w, http.StatusNotFound, "房间不存在或已关闭")
+		writeErrorCode(w, http.StatusNotFound, "room_not_found", "房间不存在或已关闭")
 		return
 	}
 	s.log.Info("使用方关闭房间", "room_id", id, "key_id", key.ID)

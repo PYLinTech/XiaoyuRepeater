@@ -40,6 +40,7 @@ const maxParticipants = Number(args.max || 0);
 const created = await client.createRoom({
   name: args.name || "XiaoyuRepeater demo room",
   maxParticipants: Number.isFinite(maxParticipants) && maxParticipants > 0 ? maxParticipants : 0,
+  metadata: { purpose: "sdk-demo" },
 });
 const room = created.room;
 const joinParams = { token: demoToken, name: "demo-user" };

@@ -36,6 +36,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/url"
 	"time"
@@ -53,6 +54,7 @@ func main() {
 
 	created, err := client.CreateRoom(ctx, xiaoyurepeater.RoomOptions{
 		Name:            "demo",
+		Metadata:        json.RawMessage(`{"tenant":"acme"}`),
 		MaxParticipants: 20,
 	})
 	if err != nil {
@@ -120,13 +122,14 @@ go run ./cmd/consumer -name "demo room"
 | `(*Client).SDKVersion(ctx)` | 查询当前中继的 SDK 元数据 |
 | `CreateRoom(ctx, RoomOptions) (CreatedRoom, error)` | 创建房间 |
 | `ListRooms(ctx) ([]Room, error)` | 列出当前密钥的房间 |
+| `GetRoom(ctx, roomID string) (Room, error)` | 查询当前密钥名下的单个房间 |
 | `CloseRoom(ctx, roomID string) error` | 关闭房间；404（不存在或已关闭）视为成功 |
 | `AgentURL() (string, error)` | 使用方通道地址 |
 | `CreatedRoom.JoinWSURL(url.Values)` | 生成用户 WS 加入地址 |
 | `CreatedRoom.JoinWebRTCURL(url.Values)` | 生成用户 WebRTC 信令地址 |
 | `JoinURL(rawURL string, url.Values)` | 给任意房间地址追加查询参数（同名参数覆盖） |
 
-`RoomOptions` 的零值会被省略，由中继应用自身默认配置。
+`RoomOptions` 的零值会被省略，由中继应用自身默认配置。`Metadata` 是 `json.RawMessage`，中继原样保存；它也会出现在 `Room`、`RoomSnapshot` 与 `AuthRequest` 中。
 
 ### Agent
 
@@ -154,7 +157,7 @@ go run ./cmd/consumer -name "demo room"
 
 `OnHello` 与事件回调由单个调度协程按顺序执行；`Authorize` 并发执行，慢鉴权不会阻塞读取循环。回调应尽快返回，不要在其中执行长时间阻塞操作。回调里可以调用 `SetSubscriptions`。
 
-`SetSubscriptions` 会等待 `subscriptions_updated` 或 `error`；等待期间通道断开返回 `ErrDisconnected`，`ctx` 结束返回对应错误。`all=true` 表示订阅全部当前及未来轨道；空列表表示不订阅任何轨道。
+`SetSubscriptions` 会等待 `subscriptions_updated` 或 `error`；等待期间通道断开返回 `ErrDisconnected`，`ctx` 结束返回对应错误。`all=true` 表示订阅全部当前及未来轨道；空列表表示不订阅任何轨道。SDK 自动维护单调 `Revision`，确认中的 `Applied`/`Pending` 反映实际生效状态；遇到 `Stale` 会带新版本自动重试一次。
 
 ## 重连与错误
 

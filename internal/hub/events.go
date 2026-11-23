@@ -64,6 +64,7 @@ func eventRoomClosed(name, reason string) string {
 		"key_revoked":        "密钥已撤销",
 		"server_shutdown":    "服务关闭",
 		"room_replaced":      "房间被替换",
+		"room_expired":       "使用方长时间离线，房间已过期回收",
 	}[reason]
 	if label == "" {
 		label = reason

@@ -22,8 +22,13 @@ export XR_API_KEY="你的 API Key"
 import { Client, withQuery } from "./xiaoyurepeater-sdk-v1.mjs";
 
 const client = new Client("", ""); // 参数：apiKey、baseUrl
-const created = await client.createRoom({ name: "demo", maxParticipants: 20 });
+const created = await client.createRoom({
+  name: "demo",
+  metadata: { tenant: "acme" },
+  maxParticipants: 20,
+});
 const room = created.room;
+const current = await client.getRoom(room.id);
 
 console.log(withQuery(created.ws_url, { token: "短期令牌", name: "Alice" }));
 
@@ -79,8 +84,9 @@ node consumer.mjs -name "demo room"
 | --- | --- |
 | `new Client(apiKey?, baseUrl?)` | API Key 为显式参数 > `XR_API_KEY`（均缺失时报错）；服务地址为显式参数 > `XR_SERVER` > SDK 根目录 `config.json` |
 | `client.sdkVersion()` | 查询 SDK 元数据 |
-| `client.createRoom({ name?, maxParticipants? })` | 创建房间 |
+| `client.createRoom({ name?, metadata?, maxParticipants? })` | 创建房间；`metadata` 为任意 JSON，中继原样保存 |
 | `client.listRooms()` | 列出房间 |
+| `client.getRoom(roomId)` | 查询单个房间 |
 | `client.closeRoom(roomId)` | 关闭房间；404 视为成功 |
 | `client.agentUrl()` | 使用方通道地址 |
 | `client.createAgent(handler?)` | 创建使用方通道 |
@@ -110,7 +116,7 @@ node consumer.mjs -name "demo room"
 
 事件回调按顺序串行执行；`authorize` 并发执行。回调可以返回 Promise，SDK 不会因为某个事件回调阻塞读取循环。回调内可以调用 `agent.subscribe`。
 
-`subscribe` 会等待 `subscriptions_updated` 或 `error`；等待期间通道断开时以 `DisconnectedError` reject。`all: true` 表示全部当前及未来轨道；空数组表示不订阅任何轨道。
+`subscribe` 会等待 `subscriptions_updated` 或 `error`；等待期间通道断开时以 `DisconnectedError` reject。`all: true` 表示全部当前及未来轨道；空数组表示不订阅任何轨道。SDK 自动维护单调 `revision`，确认中的 `applied`/`pending` 反映实际生效状态；遇到 `stale` 会带新版本自动重试一次。
 
 ## 重连与错误
 

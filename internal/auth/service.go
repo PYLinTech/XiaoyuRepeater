@@ -141,16 +141,16 @@ func (s *Service) AllowLogin(ip string) bool {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	recent := s.recentFailuresLocked(ip, now)
-	s.failures[ip] = recent
-	return len(recent) < loginFailureLimit
+	s.pruneFailuresLocked(now)
+	return len(s.failures[ip]) < loginFailureLimit
 }
 
 func (s *Service) RecordLoginFailure(ip string) {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.failures[ip] = append(s.recentFailuresLocked(ip, now), now)
+	s.pruneFailuresLocked(now)
+	s.failures[ip] = append(s.failures[ip], now)
 }
 
 func (s *Service) ClearLoginFailures(ip string) {
@@ -159,16 +159,23 @@ func (s *Service) ClearLoginFailures(ip string) {
 	s.mu.Unlock()
 }
 
-func (s *Service) recentFailuresLocked(ip string, now time.Time) []time.Time {
+// pruneFailuresLocked drops expired histories and empty IP entries so spoofed
+// or rotating client addresses cannot grow the failure map without bound.
+func (s *Service) pruneFailuresLocked(now time.Time) {
 	cutoff := now.Add(-loginFailureWindow)
-	existing := s.failures[ip]
-	kept := existing[:0]
-	for _, t := range existing {
-		if t.After(cutoff) {
-			kept = append(kept, t)
+	for ip, existing := range s.failures {
+		kept := existing[:0]
+		for _, t := range existing {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
 		}
+		if len(kept) == 0 {
+			delete(s.failures, ip)
+			continue
+		}
+		s.failures[ip] = kept
 	}
-	return kept
 }
 
 func (s *Service) pruneLocked(now time.Time) {

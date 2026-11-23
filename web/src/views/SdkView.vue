@@ -46,7 +46,7 @@ const packages = [
     runtime: '1.24+',
     path: 'go/',
     icon: 'code',
-    desc: '房间管理、使用方通道、鉴权回调与轨道订阅',
+    desc: '房间管理与不透明 metadata、使用方通道、鉴权回调与轨道订阅',
   },
   {
     name: 'Node.js',
@@ -131,7 +131,7 @@ onMounted(loadInfo)
             <span class="tag tag-accent">v{{ version }}</span>
           </div>
           <p class="sdk-desc">
-            控制面 SDK：创建房间、保持使用方通道、实时鉴权与订阅 WebRTC 轨道。不接触用户数据和媒体内容。
+            控制面 SDK：创建与查询房间、透传房间 metadata、保持使用方通道、实时鉴权与订阅 WebRTC 轨道。不接触用户数据和媒体内容。
           </p>
           <div class="sdk-meta">
             <span>控制协议 v{{ protocol }}</span>

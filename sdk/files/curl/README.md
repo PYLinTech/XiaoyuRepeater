@@ -26,10 +26,10 @@ curl -sS -o XiaoyuRepeater_SDK_v1.zip "$XR_SERVER/api/sdk/download"
 curl -sS -X POST "$XR_SERVER/v1/rooms" \
   -H "Authorization: Bearer $XR_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name":"demo room","max_participants":20}'
+  -d '{"name":"demo room","metadata":{"tenant":"acme"},"max_participants":20}'
 ```
 
-`name` 与 `max_participants` 都可省略；省略时由中继使用默认值。未知字段、空请求体或格式错误会返回 400。
+`name`、`metadata` 与 `max_participants` 都可省略；省略时由中继使用默认值。`metadata` 是任意 JSON，中继原样保存并回传，不解析结构。未知字段、空请求体或格式错误会返回 400。
 
 响应节选（`webrtc_*` 仅在启用 WebRTC 时出现）：
 
@@ -52,14 +52,17 @@ curl -sS -X POST "$XR_SERVER/v1/rooms" \
 ws://127.0.0.1:8080/v1/rooms/r_xxxxxxxxx/ws?token=短期令牌&name=Alice
 ```
 
-## 列出房间
+## 查询与列出房间
 
 ```sh
+curl -sS "$XR_SERVER/v1/rooms/r_xxxxxxxxx" \
+  -H "X-Api-Key: $XR_API_KEY"
+
 curl -sS "$XR_SERVER/v1/rooms" \
   -H "X-Api-Key: $XR_API_KEY"
 ```
 
-响应为 `{"rooms":[...]}`，只包含当前密钥创建的房间。
+单房间查询返回 `{"room":{...}}`；列表返回 `{"rooms":[...]}`。两者都只包含当前密钥创建的房间，并带回创建时的 `metadata`。
 
 ## 关闭房间
 
@@ -68,7 +71,7 @@ curl -sS -X DELETE "$XR_SERVER/v1/rooms/r_xxxxxxxxx" \
   -H "Authorization: Bearer $XR_API_KEY"
 ```
 
-成功返回 200 与 `{"ok":true}`。房间不存在、已关闭或不属于当前密钥时返回 404（错误体只有 `error`，没有 `code`）；SDK 会把该 404 视为关闭成功，curl 需要自行判断。
+成功返回 200 与 `{"ok":true}`。房间不存在、已关闭或不属于当前密钥时返回 `404 room_not_found`；SDK 会把该 404 视为关闭成功，curl 需要自行判断。
 
 ## 使用方通道
 
@@ -85,13 +88,7 @@ websocat -H="Authorization: Bearer $XR_API_KEY" "$AGENT_URL"
 
 ## 错误响应
 
-普通错误只含 `error`：
-
-```json
-{ "error": "API Key 无效" }
-```
-
-房间、鉴权等控制面错误还会附带 `code`：
+所有错误响应都包含 `error` 与稳定 `code`，响应头同时带 `X-Request-Id`：
 
 ```json
 { "error": "房间人数已满", "code": "room_full" }
@@ -102,11 +99,10 @@ websocat -H="Authorization: Bearer $XR_API_KEY" "$AGENT_URL"
 | 状态码 | `code` | 含义 |
 | --- | --- | --- |
 | `400` | `invalid_max_participants` | `max_participants` 不在允许范围内 |
-| `400` | 无 | 请求体为空、格式错误、包含未知字段或过大 |
-| `401` | 无 | 缺少、无效或已撤销的 API Key |
+| `400` | `invalid_request` | 请求体为空、格式错误、包含未知字段或过大 |
+| `401` | `missing_api_key` / `invalid_api_key` | 缺少、无效或已删除的 API Key；并发撤销瞬间可能返回 `api_key_revoked` |
 | `403` | `auth_denied` | 用户鉴权被拒绝（用户侧） |
-| `404` | `room_not_found` | 用户加入时房间不存在 |
-| `404` | 无 | 关闭房间时房间不存在、已关闭或不属于当前密钥 |
+| `404` | `room_not_found` | 房间不存在、已关闭或不属于当前密钥 |
 | `409` | `room_full` | 房间人数已满 |
 | `410` | `room_closed` | 房间已关闭 |
 | `429` | `too_many_rooms` | 该密钥创建的房间数量已达上限 |

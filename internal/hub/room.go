@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"encoding/json"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 type Room struct {
 	ID              string
 	Name            string
+	Metadata        json.RawMessage
 	KeyID           string
 	KeyName         string
 	MaxParticipants int
@@ -25,10 +27,39 @@ type Room struct {
 	rtcMu     sync.Mutex
 	published map[string]*publishedTrack
 
-	messages   atomic.Int64
-	bytes      atomic.Int64
-	rtpPackets atomic.Int64
-	rtpBytes   atomic.Int64
+	activity     atomic.Int64
+	agentOffline atomic.Int64
+	messages     atomic.Int64
+	bytes        atomic.Int64
+	rtpPackets   atomic.Int64
+	rtpBytes     atomic.Int64
+	rtpDropped   atomic.Int64
+}
+
+func (r *Room) touch() {
+	r.activity.Store(time.Now().UnixNano())
+}
+
+func (r *Room) lastActivity() time.Time {
+	if ns := r.activity.Load(); ns > 0 {
+		return time.Unix(0, ns)
+	}
+	return r.CreatedAt
+}
+
+func (r *Room) markAgentOnline() {
+	r.agentOffline.Store(0)
+}
+
+func (r *Room) markAgentOffline() {
+	r.agentOffline.CompareAndSwap(0, time.Now().UnixNano())
+}
+
+func (r *Room) agentOfflineAt() time.Time {
+	if ns := r.agentOffline.Load(); ns > 0 {
+		return time.Unix(0, ns)
+	}
+	return time.Time{}
 }
 
 func (r *Room) addParticipant(p *Participant) *Error {
@@ -41,6 +72,7 @@ func (r *Room) addParticipant(p *Participant) *Error {
 		return ErrRoomFull
 	}
 	r.participants[p.ID] = p
+	r.touch()
 	return nil
 }
 
@@ -54,6 +86,7 @@ func (r *Room) addPeer(p *RTCPeer) *Error {
 		return ErrRoomFull
 	}
 	r.peers[p.ID] = p
+	r.touch()
 	return nil
 }
 
@@ -64,6 +97,7 @@ func (r *Room) removeParticipant(id string) bool {
 		return false
 	}
 	delete(r.participants, id)
+	r.touch()
 	return true
 }
 
@@ -74,6 +108,7 @@ func (r *Room) removePeer(id string) bool {
 		return false
 	}
 	delete(r.peers, id)
+	r.touch()
 	return true
 }
 
@@ -137,6 +172,7 @@ func (r *Room) publish(track *publishedTrack) bool {
 		r.published = make(map[string]*publishedTrack)
 	}
 	r.published[track.key] = track
+	r.touch()
 	return true
 }
 
@@ -189,9 +225,10 @@ func (r *Room) connectionRefs() []protocol.ConnectionRef {
 	}
 	for _, p := range r.peers {
 		out = append(out, protocol.ConnectionRef{
-			ConnID:    p.ID,
-			Transport: protocol.TransportWebRTC,
-			Subject:   p.Subject,
+			ConnID:        p.ID,
+			Transport:     protocol.TransportWebRTC,
+			Subject:       p.Subject,
+			Subscriptions: p.subscriptionState(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -234,6 +271,7 @@ func (r *Room) snapshot(agentOnline bool) RoomInfo {
 	return RoomInfo{
 		ID:               r.ID,
 		Name:             r.Name,
+		Metadata:         cloneMetadata(r.Metadata),
 		KeyID:            r.KeyID,
 		KeyName:          r.KeyName,
 		CreatedAt:        r.CreatedAt,
@@ -242,12 +280,29 @@ func (r *Room) snapshot(agentOnline bool) RoomInfo {
 		Participants:     participants,
 		AgentOnline:      agentOnline,
 		RTCPeers:         peerCount,
+		RTCSubscriptions: r.subscriptionCount(),
 		Tracks:           r.publishedCount(),
 		Messages:         r.messages.Load(),
 		Bytes:            r.bytes.Load(),
 		RTPPackets:       r.rtpPackets.Load(),
 		RTPBytes:         r.rtpBytes.Load(),
+		RTPDropped:       r.rtpDropped.Load(),
+		LastActivity:     r.lastActivity(),
 	}
+}
+
+func (r *Room) subscriptionCount() int {
+	r.mu.RLock()
+	peers := make([]*RTCPeer, 0, len(r.peers))
+	for _, p := range r.peers {
+		peers = append(peers, p)
+	}
+	r.mu.RUnlock()
+	total := 0
+	for _, p := range peers {
+		total += p.subscriptionCount()
+	}
+	return total
 }
 
 func (r *Room) recordTraffic(n int64) {
@@ -258,6 +313,10 @@ func (r *Room) recordTraffic(n int64) {
 func (r *Room) recordRTP(n int64) {
 	r.rtpPackets.Add(1)
 	r.rtpBytes.Add(n)
+}
+
+func (r *Room) recordRTPDrop() {
+	r.rtpDropped.Add(1)
 }
 
 func sortParticipants(items []ParticipantInfo) {
@@ -281,6 +340,7 @@ type ParticipantInfo struct {
 type RoomInfo struct {
 	ID               string            `json:"id"`
 	Name             string            `json:"name"`
+	Metadata         json.RawMessage   `json:"metadata,omitempty"`
 	KeyID            string            `json:"key_id"`
 	KeyName          string            `json:"key_name"`
 	CreatedAt        time.Time         `json:"created_at"`
@@ -289,9 +349,12 @@ type RoomInfo struct {
 	Participants     []ParticipantInfo `json:"participants"`
 	AgentOnline      bool              `json:"agent_online"`
 	RTCPeers         int               `json:"rtc_peers"`
+	RTCSubscriptions int               `json:"rtc_subscriptions"`
 	Tracks           int               `json:"tracks"`
 	Messages         int64             `json:"messages"`
 	Bytes            int64             `json:"bytes"`
 	RTPPackets       int64             `json:"rtp_packets"`
 	RTPBytes         int64             `json:"rtp_bytes"`
+	RTPDropped       int64             `json:"rtp_dropped"`
+	LastActivity     time.Time         `json:"last_activity"`
 }

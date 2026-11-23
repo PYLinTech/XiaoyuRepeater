@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -24,15 +25,24 @@ type Config struct {
 	MaxParticipantsCap     int
 	MaxFrameBytes          int64
 	AuthTimeout            time.Duration
+	AgentSubscriptionQueue int
+	RoomSweepInterval      time.Duration
+	RoomOrphanTTL          time.Duration
 	WebRTC                 WebRTCConfig
 }
 
 type WebRTCConfig struct {
-	Enabled          bool
-	UDPPortMin       int
-	UDPPortMax       int
-	PublicIPs        []string
-	MaxTracksPerPeer int
+	Enabled           bool
+	UDPPortMin        int
+	UDPPortMax        int
+	PublicIPs         []string
+	MaxTracksPerPeer  int
+	VideoQueuePackets int
+	AudioQueuePackets int
+	ConnectTimeout    time.Duration
+	PendingICELimit   int
+	MaxDesiredTracks  int
+	DesiredTTL        time.Duration
 }
 
 type Hub struct {
@@ -46,19 +56,50 @@ type Hub struct {
 	agents map[string]*Agent
 	closed bool
 
+	stop     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+
 	events *eventLog
 
-	messagesRelayed atomic.Int64
-	bytesRelayed    atomic.Int64
-	rtpPackets      atomic.Int64
-	rtpBytes        atomic.Int64
-	joinsTotal      atomic.Int64
-	roomsCreated    atomic.Int64
-	authRequests    atomic.Int64
-	authDenied      atomic.Int64
+	messagesRelayed     atomic.Int64
+	bytesRelayed        atomic.Int64
+	rtpPackets          atomic.Int64
+	rtpBytes            atomic.Int64
+	rtpQueueDepth       atomic.Int64
+	rtpQueueDropped     atomic.Int64
+	keyframeRequests    atomic.Int64
+	negotiationFailures atomic.Int64
+	iceRestarts         atomic.Int64
+	roomsReclaimed      atomic.Int64
+	joinsTotal          atomic.Int64
+	roomsCreated        atomic.Int64
+	authRequests        atomic.Int64
+	authDenied          atomic.Int64
 }
 
 func New(cfg Config, log *slog.Logger) (*Hub, error) {
+	if cfg.RoomSweepInterval <= 0 {
+		cfg.RoomSweepInterval = 15 * time.Second
+	}
+	if cfg.RoomOrphanTTL <= 0 {
+		cfg.RoomOrphanTTL = 30 * time.Minute
+	}
+	if cfg.AgentSubscriptionQueue <= 0 {
+		cfg.AgentSubscriptionQueue = 256
+	}
+	if cfg.WebRTC.VideoQueuePackets <= 0 {
+		cfg.WebRTC.VideoQueuePackets = 256
+	}
+	if cfg.WebRTC.AudioQueuePackets <= 0 {
+		cfg.WebRTC.AudioQueuePackets = 200
+	}
+	if cfg.WebRTC.MaxDesiredTracks <= 0 {
+		cfg.WebRTC.MaxDesiredTracks = 512
+	}
+	if cfg.WebRTC.DesiredTTL <= 0 {
+		cfg.WebRTC.DesiredTTL = 5 * time.Minute
+	}
 	h := &Hub{
 		cfg:    cfg,
 		log:    log,
@@ -66,6 +107,7 @@ func New(cfg Config, log *slog.Logger) (*Hub, error) {
 		rooms:  make(map[string]*Room),
 		agents: make(map[string]*Agent),
 		events: newEventLog(100),
+		stop:   make(chan struct{}),
 	}
 	if cfg.WebRTC.Enabled {
 		api, err := newWebRTCAPI(cfg.WebRTC)
@@ -74,13 +116,45 @@ func New(cfg Config, log *slog.Logger) (*Hub, error) {
 		}
 		h.rtcAPI = api
 	}
+	h.wg.Add(1)
+	go h.janitor()
 	return h, nil
 }
 
 func (h *Hub) StartedAt() time.Time { return h.start }
 
-func (h *Hub) CreateRoom(keyID, keyName, name string, maxParticipants int) (RoomInfo, *Error) {
-	name = cleanString(strings.TrimSpace(name), 80, "未命名房间")
+// RoomOptions is the generic creation contract. Metadata is opaque JSON that
+// the relay stores and returns unchanged; it never interprets its structure.
+type RoomOptions struct {
+	Name            string
+	Metadata        json.RawMessage
+	MaxParticipants int
+}
+
+func normalizeMetadata(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return nil, nil
+	}
+	if !json.Valid(raw) {
+		return nil, fmt.Errorf("metadata 必须是有效 JSON")
+	}
+	return cloneMetadata(raw), nil
+}
+
+func cloneMetadata(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
+}
+
+func (h *Hub) CreateRoom(keyID, keyName string, options RoomOptions) (RoomInfo, *Error) {
+	name := cleanString(strings.TrimSpace(options.Name), 80, "未命名房间")
+	metadata, err := normalizeMetadata(options.Metadata)
+	if err != nil {
+		return RoomInfo{}, hError(400, "invalid_metadata", err.Error())
+	}
+	maxParticipants := options.MaxParticipants
 	if maxParticipants == 0 {
 		maxParticipants = h.cfg.DefaultMaxParticipants
 	}
@@ -111,6 +185,7 @@ func (h *Hub) CreateRoom(keyID, keyName, name string, maxParticipants int) (Room
 	room := &Room{
 		ID:              id,
 		Name:            name,
+		Metadata:        metadata,
 		KeyID:           keyID,
 		KeyName:         keyName,
 		MaxParticipants: maxParticipants,
@@ -118,6 +193,10 @@ func (h *Hub) CreateRoom(keyID, keyName, name string, maxParticipants int) (Room
 		participants:    make(map[string]*Participant),
 		peers:           make(map[string]*RTCPeer),
 		published:       make(map[string]*publishedTrack),
+	}
+	room.touch()
+	if h.agents[keyID] == nil {
+		room.markAgentOffline()
 	}
 	h.rooms[id] = room
 	online := h.agents[keyID] != nil
@@ -225,10 +304,66 @@ func (h *Hub) DisconnectAgent(keyID, reason string) {
 	h.mu.Lock()
 	agent := h.agents[keyID]
 	delete(h.agents, keyID)
+	for _, room := range h.rooms {
+		if room.KeyID == keyID {
+			room.markAgentOffline()
+		}
+	}
 	h.mu.Unlock()
 	if agent != nil {
 		agent.closeWith(4003, reason)
 		agent.failPending(ErrAgentOffline)
+	}
+}
+
+// janitor reclaims only objects that are provably expired: rooms whose owning
+// agent has been offline past the lease TTL, or rooms already marked closed
+// but still mapped. Live rooms are never touched.
+func (h *Hub) janitor() {
+	defer h.wg.Done()
+	ticker := time.NewTicker(h.cfg.RoomSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.stop:
+			return
+		case now := <-ticker.C:
+			h.sweep(now)
+		}
+	}
+}
+
+func (h *Hub) sweep(now time.Time) {
+	var expired []*Room
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	for id, room := range h.rooms {
+		if room.isClosed() {
+			delete(h.rooms, id)
+			continue
+		}
+		offlineAt := room.agentOfflineAt()
+		if offlineAt.IsZero() {
+			continue
+		}
+		if now.Sub(offlineAt) < h.cfg.RoomOrphanTTL {
+			continue
+		}
+		delete(h.rooms, id)
+		expired = append(expired, room)
+	}
+	h.mu.Unlock()
+
+	for _, room := range expired {
+		h.roomsReclaimed.Add(1)
+		h.closeRoom(room, "room_expired", false)
+		h.log.Info("回收失联使用方的房间",
+			"room_id", room.ID, "key_id", room.KeyID,
+			"ttl", h.cfg.RoomOrphanTTL.String(),
+			"tracks", room.publishedCount())
 	}
 }
 
@@ -284,6 +419,7 @@ func (h *Hub) AuthorizeJoin(ctx context.Context, roomID, transport, remoteAddr s
 		RequestID:   requestID,
 		RoomID:      room.ID,
 		RoomName:    room.Name,
+		Metadata:    cloneMetadata(room.Metadata),
 		Transport:   transport,
 		RemoteAddr:  remoteAddr,
 		Query:       query,
@@ -402,6 +538,7 @@ func (h *Hub) removeParticipant(p *Participant, reason string) {
 
 func (h *Hub) relay(sender *Participant, messageType int, data []byte) {
 	room := sender.room
+	room.touch()
 	room.mu.RLock()
 	if room.closed {
 		room.mu.RUnlock()
@@ -462,19 +599,24 @@ func (h *Hub) ServeAgent(ws *websocket.Conn, keyID, keyName, remoteAddr string) 
 	agent := newAgent(h, ws, keyID, keyName, remoteAddr)
 	h.agents[keyID] = agent
 	refs := make([]protocol.RoomRef, 0)
+	var peers []*RTCPeer
 	for _, room := range h.rooms {
 		if room.KeyID != keyID {
 			continue
 		}
+		room.markAgentOnline()
+		room.touch()
 		connections := room.connectionRefs()
 		refs = append(refs, protocol.RoomRef{
 			ID:           room.ID,
 			Name:         room.Name,
+			Metadata:     cloneMetadata(room.Metadata),
 			Participants: len(connections),
 			CreatedAt:    room.CreatedAt,
 			Connections:  connections,
 			Tracks:       room.trackInfos(),
 		})
+		peers = append(peers, room.peersSnapshot()...)
 	}
 	// Enqueue hello before releasing the hub lock so no room event can be
 	// delivered ahead of the handshake snapshot.
@@ -486,6 +628,7 @@ func (h *Hub) ServeAgent(ws *websocket.Conn, keyID, keyName, remoteAddr string) 
 		KeyName:    keyName,
 		ServerTime: time.Now().UTC(),
 		Rooms:      refs,
+		Features:   []string{"subscription_ack", "subscription_snapshot", "room_metadata"},
 		Limits: protocol.Limits{
 			MaxRooms:             h.cfg.MaxRoomsPerKey,
 			MaxFrameBytes:        h.cfg.MaxFrameBytes,
@@ -503,7 +646,14 @@ func (h *Hub) ServeAgent(ws *websocket.Conn, keyID, keyName, remoteAddr string) 
 		old.failPending(ErrAgentOffline)
 	}
 
+	// Re-apply stored desired subscriptions so the snapshot and the peers
+	// agree even if tracks were published while the agent was offline.
+	for _, peer := range peers {
+		peer.reconcileAsync()
+	}
+
 	go agent.writeLoop()
+	go agent.subscriptionLoop()
 	h.events.add("agent_online", fmt.Sprintf("使用方「%s」已连接", keyName), "", "")
 	h.log.Info("使用方已连接", "agent_id", agent.id, "key_id", keyID, "name", keyName, "remote_addr", remoteAddr)
 
@@ -513,6 +663,11 @@ func (h *Hub) ServeAgent(ws *websocket.Conn, keyID, keyName, remoteAddr string) 
 	wasCurrent := h.agents[keyID] == agent
 	if wasCurrent {
 		delete(h.agents, keyID)
+		for _, room := range h.rooms {
+			if room.KeyID == keyID {
+				room.markAgentOffline()
+			}
+		}
 	}
 	h.mu.Unlock()
 	agent.closeWith(websocket.CloseNormalClosure, "agent disconnected")
@@ -546,6 +701,7 @@ func (h *Hub) Snapshot() Snapshot {
 	totalParticipants := 0
 	totalRTCPeers := 0
 	totalRTCTracks := 0
+	totalSubscriptions := 0
 	for _, room := range rooms {
 		info := room.snapshot(online[room.KeyID])
 		roomInfos = append(roomInfos, info)
@@ -554,6 +710,7 @@ func (h *Hub) Snapshot() Snapshot {
 		totalParticipants += info.ParticipantCount
 		totalRTCPeers += info.RTCPeers
 		totalRTCTracks += info.Tracks
+		totalSubscriptions += info.RTCSubscriptions
 	}
 	sort.Slice(roomInfos, func(i, j int) bool { return roomInfos[i].CreatedAt.After(roomInfos[j].CreatedAt) })
 
@@ -575,20 +732,27 @@ func (h *Hub) Snapshot() Snapshot {
 		StartedAt:     h.start,
 		UptimeSeconds: int64(time.Since(h.start).Seconds()),
 		Stats: StatsSnapshot{
-			AgentsOnline:    len(agents),
-			ActiveRooms:     len(rooms),
-			Participants:    totalParticipants,
-			RTCPeers:        totalRTCPeers,
-			RTCTracks:       totalRTCTracks,
-			Closed:          closed,
-			MessagesRelayed: h.messagesRelayed.Load(),
-			BytesRelayed:    h.bytesRelayed.Load(),
-			RTPPackets:      h.rtpPackets.Load(),
-			RTPBytes:        h.rtpBytes.Load(),
-			JoinsTotal:      h.joinsTotal.Load(),
-			RoomsCreated:    h.roomsCreated.Load(),
-			AuthRequests:    h.authRequests.Load(),
-			AuthDenied:      h.authDenied.Load(),
+			AgentsOnline:        len(agents),
+			ActiveRooms:         len(rooms),
+			Participants:        totalParticipants,
+			RTCPeers:            totalRTCPeers,
+			RTCTracks:           totalRTCTracks,
+			RTCSubscriptions:    totalSubscriptions,
+			Closed:              closed,
+			MessagesRelayed:     h.messagesRelayed.Load(),
+			BytesRelayed:        h.bytesRelayed.Load(),
+			RTPPackets:          h.rtpPackets.Load(),
+			RTPBytes:            h.rtpBytes.Load(),
+			RTPQueueDepth:       h.rtpQueueDepth.Load(),
+			RTPQueueDropped:     h.rtpQueueDropped.Load(),
+			KeyframeRequests:    h.keyframeRequests.Load(),
+			NegotiationFailures: h.negotiationFailures.Load(),
+			ICERestarts:         h.iceRestarts.Load(),
+			RoomsReclaimed:      h.roomsReclaimed.Load(),
+			JoinsTotal:          h.joinsTotal.Load(),
+			RoomsCreated:        h.roomsCreated.Load(),
+			AuthRequests:        h.authRequests.Load(),
+			AuthDenied:          h.authDenied.Load(),
 		},
 		Rooms:  roomInfos,
 		Agents: agentInfos,
@@ -597,6 +761,9 @@ func (h *Hub) Snapshot() Snapshot {
 }
 
 func (h *Hub) Shutdown() {
+	h.stopOnce.Do(func() { close(h.stop) })
+	h.wg.Wait()
+
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -632,20 +799,27 @@ func (h *Hub) Shutdown() {
 }
 
 type StatsSnapshot struct {
-	AgentsOnline    int   `json:"agents_online"`
-	ActiveRooms     int   `json:"active_rooms"`
-	Participants    int   `json:"participants"`
-	RTCPeers        int   `json:"rtc_peers"`
-	RTCTracks       int   `json:"rtc_tracks"`
-	Closed          bool  `json:"closed"`
-	MessagesRelayed int64 `json:"messages_relayed"`
-	BytesRelayed    int64 `json:"bytes_relayed"`
-	RTPPackets      int64 `json:"rtp_packets"`
-	RTPBytes        int64 `json:"rtp_bytes"`
-	JoinsTotal      int64 `json:"joins_total"`
-	RoomsCreated    int64 `json:"rooms_created"`
-	AuthRequests    int64 `json:"auth_requests"`
-	AuthDenied      int64 `json:"auth_denied"`
+	AgentsOnline        int   `json:"agents_online"`
+	ActiveRooms         int   `json:"active_rooms"`
+	Participants        int   `json:"participants"`
+	RTCPeers            int   `json:"rtc_peers"`
+	RTCTracks           int   `json:"rtc_tracks"`
+	RTCSubscriptions    int   `json:"rtc_subscriptions"`
+	Closed              bool  `json:"closed"`
+	MessagesRelayed     int64 `json:"messages_relayed"`
+	BytesRelayed        int64 `json:"bytes_relayed"`
+	RTPPackets          int64 `json:"rtp_packets"`
+	RTPBytes            int64 `json:"rtp_bytes"`
+	RTPQueueDepth       int64 `json:"rtp_queue_depth"`
+	RTPQueueDropped     int64 `json:"rtp_queue_dropped"`
+	KeyframeRequests    int64 `json:"keyframe_requests"`
+	NegotiationFailures int64 `json:"negotiation_failures"`
+	ICERestarts         int64 `json:"ice_restarts"`
+	RoomsReclaimed      int64 `json:"rooms_reclaimed"`
+	JoinsTotal          int64 `json:"joins_total"`
+	RoomsCreated        int64 `json:"rooms_created"`
+	AuthRequests        int64 `json:"auth_requests"`
+	AuthDenied          int64 `json:"auth_denied"`
 }
 
 type AgentInfo struct {

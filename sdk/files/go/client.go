@@ -103,6 +103,15 @@ func (c *Client) ListRooms(ctx context.Context) ([]Room, error) {
 	return out.Rooms, err
 }
 
+// GetRoom returns one live room owned by this API key.
+func (c *Client) GetRoom(ctx context.Context, roomID string) (Room, error) {
+	var out struct {
+		Room Room `json:"room"`
+	}
+	err := c.do(ctx, http.MethodGet, "/v1/rooms/"+url.PathEscape(roomID), nil, &out)
+	return out.Room, err
+}
+
 // CloseRoom closes a room. A room that is already gone is treated as success,
 // which makes cleanup idempotent.
 func (c *Client) CloseRoom(ctx context.Context, roomID string) error {
